@@ -6,6 +6,7 @@ settings.json
 # 个人数据：作品记录和 MarginNote 导出的样本，不进版本库
 data/
 导入样本/
+IMG_*
 # 打包输出
 build/
 dist/
