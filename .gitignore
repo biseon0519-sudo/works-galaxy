@@ -1,0 +1,14 @@
+# 运行环境和缓存
+.venv/
+__pycache__/
+log.txt
+settings.json
+# 个人数据：作品记录和 MarginNote 导出的样本，不进版本库
+data/
+导入样本/
+# 打包输出
+build/
+dist/
+# 本地专用：给 Claude 的项目笔记、本机快捷方式
+CLAUDE.md
+*.lnk
