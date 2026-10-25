@@ -28,6 +28,13 @@ CINE_X, CINE_SHADOW = 0.15, 0.10      # 展开时黑洞在画面左边的位置�
 CINE_ROLL = -0.10         # 展开时黑洞稍微歪一点，更有镜头感
 DISK_OUT = 6.2            # 吸积盘外缘（以视界半径为单位，和着色器里的 R_OUT 一致）
 SWALLOW_MS, BIRTH_MS = 1300, 1000     # 收起时被黑洞吞掉、展开时从黑洞里螺旋飞出的动画时长
+# 收起时恒星化成星尘被吸进去（艺术化的“越过洛希极限解体”，和胶囊碎成晶尘同一个路子）：
+# 恒星飞向黑洞、轻微拉长，到洛希极限时化成一小团闪烁的星尘，先轻轻飘开，再被越来越强的吸力带着旋转落进吸积盘
+ROCHE = RS * 4.0          # 洛希极限（世界坐标，离黑洞中心）
+TDE_AT = 0.42             # 动画进行到多少时化成星尘
+TDE_N = 100               # 每颗恒星化成多少颗星尘
+PULL0, PULL1 = 60.0, 1400.0           # 吸力：一开始很弱，随时间（秒）平方增强
+SWIRL = 0.45              # 吸进去时带一点旋转（切向力占径向力的比例）
 ROPE_LAG, ROPE_K, ROPE_D = 0.5, 22.0, 6.0     # 分支光丝的惯性：端点动时控制点只跟上一部分，再靠弹簧追上
 STAR_R = 21               # 恒星半径
 FOCAL = 900.0             # 透视焦距：z 越大越近
@@ -329,7 +336,7 @@ void main(){
     float gran = fbm(q * 3.2 / (0.6 + mu) + vec2(u_time * 0.04, seed * 13.0));
     vec3 surf = mix(c, vec3(1.0), 0.3 * mu) * (0.55 + 0.75 * limb) * (0.85 + 0.35 * gran) * 1.9;
     float lift = (0.8 + 0.45 * hv + 0.35 * act) * bright * (0.92 + 0.08 * sin(u_time * 1.6 + seed * 20.0));
-    lift *= 1.0 + 2.2 * exp(-pow((doom - 0.82) / 0.1, 2.0));   // 落进盘里那一下亮一下
+    lift *= 1.0 + 1.5 * smoothstep(0.3, 0.5, doom);          // 化成星尘前亮一下
     float corona = exp(-max(r - 1.0, 0.0) * 1.7) * 1.1 + exp(-max(r - 1.0, 0.0) * 0.6) * 0.18;
     vec3 em = c * corona * lift * (1.0 - smoothstep(3.2, 4.9, max(abs(q0.x), abs(q0.y))));   // 画到方块边缘前淡掉
     vec3 col = surf * body * (0.8 + 0.3 * lift) + em * (1.0 - body * 0.6);
@@ -422,19 +429,23 @@ float particles(float along, float x, float speed, float spacing, float seed, fl
 void main(){
     float x = v_x;
     vec3 col;
-    if (v_kind < 0.5){
+    float kindId = floor(v_kind), seed = fract(v_kind);    // 整数部分是种类，小数部分是这条线自己的随机种子
+    // 每条线按自己的种子错开雾和粒子的图案；不然几条线会同时变淡、同时变亮，像一起呼吸
+    if (kindId < 0.5){
         // 物质流：一层断断续续的薄雾 + 往黑洞里流的粒子，越靠近黑洞流得越快
         float flow = v_along * (1.0 - 0.35 * v_s);    // 越靠近黑洞空间越“短”，同样速度看起来流得越快；对 along 的导数约 1 - 0.7s，始终为正，方向不会反
-        float mist = fbm(vec2(flow * 0.018 - u_time * 0.5, x * 0.15));
-        float haze = exp(-x * x / (2.0 * 3.2 * 3.2)) * smoothstep(0.38, 0.8, mist) * 0.22;
-        float pt = particles(flow, x, 30.0, 11.0, 1.0, 3.5) + particles(flow, x, 21.0, 17.0, 7.0, 6.0) * 0.7;
+        float mist = fbm(vec2(flow * 0.018 - u_time * 0.5 + seed * 37.0, x * 0.15 + seed * 11.0));
+        float haze = exp(-x * x / (2.0 * 3.2 * 3.2)) * (0.07 + 0.17 * smoothstep(0.38, 0.8, mist));   // 留一层最低亮度
+        float pt = particles(flow + seed * 500.0, x, 30.0, 11.0, 1.0 + seed * 13.0, 3.5)
+                 + particles(flow + seed * 300.0, x, 21.0, 17.0, 7.0 + seed * 13.0, 6.0) * 0.7;
         float fade = smoothstep(0.0, 0.12, v_s) * (1.0 - smoothstep(0.75, 1.0, v_s));
         col = (v_color.rgb * (haze + pt * 1.5) + vec3(pt * 0.45)) * fade;
     } else {
         // 分支光丝：更细更稀疏，一丝很淡的线 + 稀疏的光点往外流
-        float mist = fbm(vec2(v_along * 0.025 - u_time * 0.4, 0.0));
+        float mist = fbm(vec2(v_along * 0.025 - u_time * 0.4 + seed * 37.0, seed * 11.0));
         float haze = exp(-x * x / (2.0 * 1.6 * 1.6)) * (0.10 + 0.16 * smoothstep(0.3, 0.75, mist));
-        float pt = particles(v_along, x, 26.0, 14.0, 3.0, 2.0) + particles(v_along, x, 17.0, 23.0, 9.0, 3.0) * 0.6;
+        float pt = particles(v_along + seed * 500.0, x, 26.0, 14.0, 3.0 + seed * 13.0, 2.0)
+                 + particles(v_along + seed * 300.0, x, 17.0, 23.0, 9.0 + seed * 13.0, 3.0) * 0.6;
         col = v_color.rgb * (haze + pt * 1.3) + vec3(pt * 0.35);
     }
     f = vec4(col * v_color.a, 0.0);
@@ -450,6 +461,15 @@ out vec4 f;
 void main(){
     float s = v_p1.x, a = v_p1.y, ph = v_p1.z;
     vec2 q = v_local / s;
+    if (v_p1.w > 0.5){                                       // 恒星碎屑：顺着运动方向拉长的柔和气团（短流线）
+        vec2 dir = v_p2.xy;
+        q = vec2(dot(q, dir) / max(v_p2.z, 1.0), dot(q, vec2(-dir.y, dir.x)));
+        float r = length(q);
+        float core = exp(-r * r * 0.9), halo = exp(-r * 0.9) * 0.25;
+        float win2 = 1.0 - smoothstep(3.5, 5.0, max(abs(v_local.x), abs(v_local.y)) / (s * max(v_p2.z, 1.0)));
+        f = vec4((v_color.rgb * (core * 1.3 + halo) + vec3(core * 0.3)) * a * win2, 0.0);
+        return;
+    }
     float dia = abs(q.x) + abs(q.y);
     float core = exp(-dia * dia * 1.2);
     float tw = 0.55 + 0.45 * sin(u_time * 9.0 + ph * 40.0);
@@ -468,10 +488,12 @@ void main(){ f = vec4(texture(u_tex, v_uv).rgb, 1.0); }
 '''
 
 BEAM_HW = 20.0            # 光线条带的半宽（屏幕像素），要盖住柔光的范围
-BEAM_SEG = 18             # 每条线切成几段
-# 物质流的惯性：每个点跟不上的比例（两头 0、中间最大），弹簧劲度、阻尼（软一点，带一点轻微的摆）
-STREAM_LAG = (np.sin(np.linspace(0, 1, BEAM_SEG + 1) * np.pi) ** 0.8 * 0.85)
-STREAM_K, STREAM_D = 9.0, 4.5
+BEAM_SEG = 40             # 每条线切成几段（段太少，弯的时候能看出折角）
+# 物质流像烟、像彗尾：线上离恒星 s 处的气体，是恒星大约 TRAIL_T·s 秒前放出来的，所以那一段沿着恒星刚走过的路线；
+# 越往黑洞那头越淡化回平稳的形状。来回甩会自然扭出 S 形、波浪形。只看恒星在空间里的真实移动，镜头切换不算
+TRAIL_T = 0.7
+TRAIL_W = (1 - np.linspace(0, 1, BEAM_SEG + 1)) ** 1.5
+TRAIL_MAX = 0.6                   # 尾迹偏离最多是线长的多少
 
 
 class Node:
@@ -667,9 +689,13 @@ class MindMap(QOpenGLWidget):
         self.cine = 0.0                 # 0 = 全图（黑洞在中间、斜看），1 = 展开（黑洞在左边、侧视放大）
         self.bh = (-9999.0, -9999.0, 1.0, EL_MAP, 0.0)   # 这一帧黑洞在屏幕上的 x、y、阴影半径、仰角、滚转
         self._ropes = {}                # 分支光丝的惯性状态
-        self._streams = {}              # 物质流的惯性状态（每条流一串点的偏移和速度）
+        self._trails = {}               # 物质流的尾迹：每颗恒星最近的位置记录
+        self.link_fade = 1.0            # 连线整体的显示程度：展开、收起时先隐藏，稳定后再淡入
+        self._link_hold = 0.0           # 到这个时间之前连线保持隐藏
         # 晶尘粒子，每行：世界 x、y，速度 x、y，剩余寿命，总寿命，大小，颜色 r、g、b，闪烁相位
         self.dust = np.zeros((0, 11), 'f4')
+        # 恒星被撕碎后的碎屑，格式同上，坐标是以黑洞为原点、没压扁的盘面坐标
+        self.debris = np.zeros((0, 11), 'f4')
         self._rope_t = 0.0
 
         ease = QEasingCurve(QEasingCurve.OutBack); ease.setOvershoot(1.3)      # 展开时稍微冲过头再弹回来
@@ -815,6 +841,21 @@ class MindMap(QOpenGLWidget):
         new = np.column_stack([x, y, vx, vy, life, life, rng.uniform(0.5, 1.6, cnt), col, rng.random(cnt)]).astype('f4')
         self.dust = np.concatenate([self.dust, new])
 
+    def _disrupt(self, n, r, th):
+        """恒星化成一小团星尘：在恒星的位置撒一把，先轻轻往四周飘开，之后由 _tick 里的吸力带进黑洞。"""
+        rng = np.random.default_rng()
+        c0 = np.array([r * math.cos(th), r * math.sin(th)])
+        pos = c0 + rng.normal(0, STAR_R * 0.45, (TDE_N, 2))
+        ang = rng.uniform(0, 2 * math.pi, TDE_N)
+        sp = rng.uniform(15, 60, TDE_N)
+        vel = np.stack([np.cos(ang) * sp, np.sin(ang) * sp], 1) + np.array([math.sin(th), -math.cos(th)]) * 35   # 顺着盘的转向带一点
+        life = rng.uniform(2.4, 3.2, TDE_N)
+        c = np.array([n.color.redF(), n.color.greenF(), n.color.blueF()])
+        wmix = rng.uniform(0, 0.5, (TDE_N, 1))
+        new = np.column_stack([pos, vel, life, life, rng.uniform(0.6, 1.4, TDE_N), c * (1 - wmix) + wmix,
+                               rng.random(TDE_N)]).astype('f4')
+        self.debris = np.concatenate([self.debris, new])
+
     def relayout(self, animate=True):
         targets = self._targets()
         for key, (kind, parent, text, sub, color, data, pos, polar, z) in targets.items():
@@ -850,10 +891,9 @@ class MindMap(QOpenGLWidget):
                 d = node.base - P
                 r0, th0 = math.hypot(d.x(), d.y()), math.atan2(d.y(), d.x())
                 if node.kind == 'year':
-                    # 掉进黑洞：多转一两圈，最后落在吸积盘内圈朝我们转过来的那一侧（左边一片，各自错开），不压到黑色的视界上
-                    end = math.pi + (node.seed - 0.5) * 1.2
-                    sw = -(2 * math.pi + (th0 - end) % (2 * math.pi))
-                    node.swallow = (P, r0, th0, sw, RS * (1.4 + 0.7 * node.bob[1] / 0.4), True)
+                    # 掉向黑洞：顺着盘的转向绕小半圈飞到洛希极限，在那里被撕碎（见 _disrupt）
+                    node.swallow = (P, r0, th0, -0.8 * math.pi, ROCHE * (0.95 + 0.1 * node.seed), True)
+                    node.disrupted = False
                 else:
                     node.swallow = None             # 胶囊：原地碎成晶尘
                     if animate:
@@ -862,6 +902,11 @@ class MindMap(QOpenGLWidget):
                 node.o0 = node.opacity
                 node.polar1 = None
                 node.hover = False
+        moving = any(n.fresh or n.removing or (n.p1 - n.p0).manhattanLength() > 3 or
+                     (n.polar1 is not None and n.polar0 is not None and abs(n.polar1[0] - n.polar0[0]) > 0.01)
+                     for n in self.nodes.values())
+        if animate and moving:
+            self._link_hold = float('inf')      # 有东西在飞：连线先隐藏，动画结束、稳定一会儿再出现
         if animate:
             years_out = any(n.removing and n.kind == 'year' for n in self.nodes.values())
             years_in = any(n.fresh and n.kind == 'year' for n in self.nodes.values())
@@ -881,6 +926,21 @@ class MindMap(QOpenGLWidget):
                 continue
             if n.removing:
                 P, r0, th0, sw, r_end, into_hole = n.swallow
+                if into_hole:
+                    k = min(1.0, raw / TDE_AT)          # 0 → 1：飞到洛希极限
+                    pr = k * k * (3 - 2 * k)
+                    th = th0 + sw * k ** 1.3
+                    r = lerp(r0, r_end, pr)
+                    sq = lerp(1.0, 0.7, pr)             # 越靠近越接近盘面
+                    n.base = QPointF(P.x() + r * math.cos(th), P.y() + r * math.sin(th) * sq)
+                    n.doom = 0.5 * smooth(0.5, 1.0, k)   # 轻微拉长、变暖
+                    n.dang = math.atan2(math.sin(th) * sq, math.cos(th))   # 沿指向黑洞的方向拉长
+                    n.z = lerp(n.z0, 0.0, pr)
+                    if raw >= TDE_AT and not n.disrupted:
+                        n.disrupted = True
+                        self._disrupt(n, r, th)
+                    n.opacity = n.o0 * (1 - smooth(TDE_AT - 0.02, TDE_AT + 0.1, raw))   # 解体后星体很快消失，只剩碎屑
+                    continue
                 pr = raw * raw * (3 - 2 * raw)          # 半径：先慢、中间快、最后轻轻落进去
                 th = th0 + sw * raw ** 1.5              # 角度：越转越快
                 r = lerp(r0, r_end, pr)
@@ -905,6 +965,8 @@ class MindMap(QOpenGLWidget):
     def _finish(self):
         for key in [k for k, n in self.nodes.items() if n.removing]:
             del self.nodes[key]
+        if self._link_hold == float('inf'):
+            self._link_hold = self.clock.elapsed() / 1000 + 0.3
         for n in self.nodes.values():
             n.polar0 = n.polar1
             n.fresh = False
@@ -1037,7 +1099,7 @@ class MindMap(QOpenGLWidget):
                 m.value = v
 
     def _beams(self):
-        """连线拼成三角形条带：恒星到黑洞是螺旋流进吸积盘的物质流；分支里是柔软的光丝（有惯性，节点动时会晃、会拖一点）。"""
+        """连线拼成三角形条带：恒星到黑洞是流进吸积盘的物质流；分支里是柔软的光丝。两种都有惯性，节点动时会弯、会拖一点。"""
         bx, by, shadow, el, roll = self.bh
         rd = DISK_OUT * shadow / 2.6 * 0.92             # 吸积盘外缘（屏幕像素）
         flat = max(0.05, math.sin(el))                  # 斜着看时盘被压扁的比例
@@ -1050,33 +1112,44 @@ class MindMap(QOpenGLWidget):
             a = self.nodes.get(n.parent_key)
             if a is None:
                 continue
-            op = min(a.opacity, n.opacity)
+            op = min(a.opacity, n.opacity) * self.link_fade
+            alive.add(n.key)
             if op < 0.02:
                 continue
-            alive.add(n.key)
             if a.kind == 'center':
-                # 物质流：从恒星出发，顺着盘的转向绕一段，越靠近越被压扁到盘面上
+                # 物质流：一条平滑的三次曲线，从恒星出发，顺滑地汇进吸积盘边缘（落点在恒星方向和盘的椭圆交点，最后顺一点盘的转向）
                 dx, dy = n.sx - bx, n.sy - by
-                ux, uy = dx * cr + dy * sr, -dx * sr + dy * cr
-                r0, th0 = math.hypot(ux, uy), math.atan2(uy, ux)
-                r = r0 + (rd - r0) * t ** 0.85
-                th = th0 - 0.28 * t ** 2.5               # 基本直着流向黑洞，只在快到盘时顺一下盘的转向；弯曲主要靠惯性（往哪拖就往反方向甩）
-                sq = 1 + (flat - 1) * t ** 2.2
-                px_, py_ = r * np.cos(th), r * np.sin(th) * sq
-                ideal = np.stack([bx + px_ * cr - py_ * sr, by + px_ * sr + py_ * cr], 1)
-                # 物质流有惯性：恒星自己动了（拖动、漂浮），中间那段跟不上、被拖成一道弯，再像弹簧一样慢慢顺回来。
-                # 按世界坐标算移动量，所以拖动整个画面时不会拖尾；两头（恒星、吸积盘）固定不动
-                world = (ideal - (self.width() / 2, self.height() / 2)) / self.cam_s + (self.cam_c.x(), self.cam_c.y())
-                st = self._streams.get(n.key)
-                if st is None:
-                    st = self._streams[n.key] = {'last': world, 'o': np.zeros_like(world), 'v': np.zeros_like(world)}
-                st['o'] -= (world - st['last']) * STREAM_LAG[:, None]
-                st['last'] = world
-                st['v'] += (-STREAM_K * st['o'] - STREAM_D * st['v']) * dt
-                st['o'] = np.clip(st['o'] + st['v'] * dt, -120, 120)
-                paths.append(ideal + st['o'] * self.cam_s)
+                ux, uy = dx * cr + dy * sr, -dx * sr + dy * cr          # 转到盘的坐标（去掉滚转）
+                r0 = math.hypot(ux, uy) or 1.0
+                cx_, cy_ = ux / r0, uy / r0
+                te = min(1 / math.sqrt(cx_ * cx_ / (rd * rd) + cy_ * cy_ / (rd * rd * flat * flat)), r0 * 0.6)
+                ex, ey = cx_ * te, cy_ * te
+                phi = math.atan2(ey / flat, ex)                         # 落点在椭圆上的参数角
+                tx, ty = math.sin(phi) * rd, -math.cos(phi) * rd * flat  # 盘转的方向
+                tl = math.hypot(tx, ty) or 1.0
+                L = math.hypot(ux - ex, uy - ey) or 1.0
+                ix, iy = (ex - ux) / L * 0.8 + tx / tl * 0.2, (ey - uy) / L * 0.8 + ty / tl * 0.2
+                P = np.array([(ux, uy), (ux + (ex - ux) * 0.33, uy + (ey - uy) * 0.33),
+                              (ex - ix * L * 0.3, ey - iy * L * 0.3), (ex, ey)])
+                tt = t[:, None]; mt = 1 - tt
+                q = mt ** 3 * P[0] + 3 * mt * mt * tt * P[1] + 3 * mt * tt * tt * P[2] + tt ** 3 * P[3]
+                ideal = np.stack([bx + q[:, 0] * cr - q[:, 1] * sr, by + q[:, 0] * sr + q[:, 1] * cr], 1)
+                # 尾迹：记下恒星最近的位置（世界坐标），按时间插值出每一段该在的地方
+                wpos = n.base + n.offset(now)
+                hist = self._trails.setdefault(n.key, [])
+                hist.append((now, wpos.x(), wpos.y()))
+                while len(hist) > 2 and hist[1][0] < now - TRAIL_T - 0.1:
+                    hist.pop(0)
+                ht = np.array(hist)
+                ts = now - TRAIL_T * t
+                off = np.stack([np.interp(ts, ht[:, 0], ht[:, 1]) - wpos.x(),
+                                np.interp(ts, ht[:, 0], ht[:, 2]) - wpos.y()], 1) * TRAIL_W[:, None] * self.cam_s
+                mag = np.hypot(off[:, 0], off[:, 1])
+                lim = TRAIL_MAX * L
+                off *= np.minimum(1.0, lim / np.maximum(mag, 1e-6))[:, None]
+                paths.append(ideal + off)
                 strength = 1.0 if (n.active or n.glow > 0.3) else 0.62
-                cols.append((_rgba(n.color), _rgba(DISK_COLOR), op * strength)); kinds.append(0.0)
+                cols.append((_rgba(n.color), _rgba(DISK_COLOR), op * strength)); kinds.append(0.05 + 0.9 * n.seed)
                 continue
             # 柔软光丝：控制点有惯性。端点（世界坐标）动了，控制点只跟上一部分，剩下的靠弹簧追上，所以会晃、会拖
             p1, p2 = a.edge_point(n, True), n.edge_point(a, False)
@@ -1091,19 +1164,24 @@ class MindMap(QOpenGLWidget):
                 o[2 * i] -= (world[i].x() - rope['last'][i].x()) * ROPE_LAG
                 o[2 * i + 1] -= (world[i].y() - rope['last'][i].y()) * ROPE_LAG
             rope['last'] = world
+            lim = 0.3 * math.hypot(p2[0] - p1[0], p2[1] - p1[1]) / max(self.cam_s, 1e-3)    # 最多弯到线长的 30%，不会甩出尖角
             for j in range(4):
                 v[j] += (-ROPE_K * o[j] - ROPE_D * v[j]) * dt
-                o[j] = max(-40.0, min(40.0, o[j] + v[j] * dt))
+                o[j] += v[j] * dt
+            for j in (0, 2):
+                mag = math.hypot(o[j], o[j + 1])
+                if mag > lim:
+                    o[j] *= lim / mag; o[j + 1] *= lim / mag
             k = self.cam_s
             P = np.array([p1, (ideal[0][0] + o[0] * k, ideal[0][1] + o[1] * k),
                           (ideal[1][0] + o[2] * k, ideal[1][1] + o[3] * k), p2])
             tt = t[:, None]; mt = 1 - tt
             paths.append(mt ** 3 * P[0] + 3 * mt * mt * tt * P[1] + 3 * mt * tt * tt * P[2] + tt ** 3 * P[3])
-            cols.append((_rgba(a.color), _rgba(n.color), op * 0.9)); kinds.append(1.0)
+            cols.append((_rgba(a.color), _rgba(n.color), op * 0.9)); kinds.append(1.05 + 0.9 * n.seed)
         for key in [key for key in self._ropes if key not in alive]:
             del self._ropes[key]
-        for key in [key for key in self._streams if key not in alive]:
-            del self._streams[key]
+        for key in [key for key in self._trails if key not in alive]:
+            del self._trails[key]
         if not paths:
             return 0
         E, S = len(paths), BEAM_SEG
@@ -1155,8 +1233,10 @@ class MindMap(QOpenGLWidget):
                 continue
             gl = max(n.glow, 1.0 if n.active else 0.0)
             if n.kind == 'center':
-                feed = max((math.exp(-((m.doom - 0.9) / 0.12) ** 2) for m in self.nodes.values()
-                            if m.removing and m.kind == 'year'), default=0.0)
+                feed = 0.0
+                if len(self.debris):                    # 碎屑落到黑洞附近越多，光晕越亮
+                    near = np.hypot(self.debris[:, 0], self.debris[:, 1]) < RS * 2.5
+                    feed = min(1.0, float(near.sum()) / 150.0)
                 gl = max(gl, feed)
                 rs_px = n.rpx / 2.6                     # 看到的阴影比视界大 2.6 倍（光线被弯过来）
                 half = rs_px * 11
@@ -1196,6 +1276,34 @@ class MindMap(QOpenGLWidget):
             self._set(prog, u_vp=(vw, vh), u_time=t)
             vao.render(moderngl.TRIANGLE_STRIP, instances=len(items))
 
+        if len(self.debris):
+            d = self.debris
+            bx, by, shadow, el, roll = self.bh
+            sc = shadow / RS                                    # 黑洞附近：屏幕像素 / 世界单位
+            rr = np.hypot(d[:, 0], d[:, 1])
+            close = np.clip((ROCHE - rr) / (ROCHE - RS * 2.2), 0, 1)
+            close = close * close * (3 - 2 * close)
+            sq = 0.7 + (max(0.05, math.sin(el)) - 0.7) * close
+            X, Y = d[:, 0] * sc, d[:, 1] * sq * sc
+            cr, sr = math.cos(roll), math.sin(roll)
+            sx, sy = bx + X * cr - Y * sr, by + X * sr + Y * cr
+            disk = np.array([DISK_COLOR.redF(), DISK_COLOR.greenF(), DISK_COLOR.blueF()])
+            col = d[:, 7:10] * (1 - close[:, None]) + (disk * 0.8 + 0.2) * close[:, None]
+            size = np.maximum(0.6, d[:, 6] * max(0.8, sc))
+            a = np.minimum(1.0, (d[:, 4] / d[:, 5]) ** 0.5 * 1.2)
+            # 转到黑洞后面（盘的远侧、在屏幕上偏上）又落在视界里的：被挡住
+            behind = (Y * cr + X * sr) < 0
+            a = a * np.where(behind, np.clip((np.hypot(X, Y) - shadow * 0.85) / (shadow * 0.25), 0, 1), 1.0)
+            z = np.zeros_like(sx)
+            inst = np.column_stack([sx, sy, size * 5, size * 5, col, z + 1, size, a, d[:, 10], z, z, z, z, z])   # 和晶尘一样的菱形闪光
+            prog, buf, vao = self.sprites['dust']
+            data = inst.astype('f4').tobytes()
+            if len(data) > buf.size:
+                buf.orphan(len(data) * 2)
+            buf.write(data)
+            ctx.blend_func = moderngl.ONE, moderngl.ONE
+            self._set(prog, u_vp=(vw, vh), u_time=t)
+            vao.render(moderngl.TRIANGLE_STRIP, instances=len(inst))
         if len(self.dust):
             d = self.dust
             sx = (d[:, 0] - self.cam_c.x()) * self.cam_s + vw / 2
@@ -1294,6 +1402,11 @@ class MindMap(QOpenGLWidget):
         now = self.clock.elapsed() / 1000
         dt = min(0.05, now - self._last_t); self._last_t = now
         busy = self.anim.state() == QVariantAnimation.Running or self.cam.state() == QVariantAnimation.Running
+        hide = now < self._link_hold or self.cam.state() == QVariantAnimation.Running or self.cine != self._cine_target()
+        lw = 0.0 if hide else 1.0
+        if self.link_fade != lw:                # 隐藏得快、出现得慢
+            self.link_fade = max(lw, self.link_fade - dt * 10) if hide else min(1.0, self.link_fade + dt * 2.2)
+            busy = True
         want = self._cine_target()
         if self.cine != want:
             self.cine += (want - self.cine) * min(1.0, dt * 3.2)
@@ -1315,6 +1428,21 @@ class MindMap(QOpenGLWidget):
                 if abs(n.glow - want) <= 0.005:
                     n.glow = want
             busy = busy or bool(n.v[0] or n.v[1]) or n.glow != want
+        if len(self.debris):
+            d = self.debris
+            age = d[:, 5] - d[:, 4]
+            r = np.hypot(d[:, 0], d[:, 1]) + 1e-3
+            ux, uy = d[:, 0] / r, d[:, 1] / r
+            pull = (PULL0 + PULL1 * age * age) * dt          # 吸力越来越强
+            d[:, 2] += (-ux + SWIRL * uy) * pull             # 往里吸，顺着盘的转向带点旋转
+            d[:, 3] += (-uy - SWIRL * ux) * pull
+            d[:, 2:4] *= math.exp(-1.2 * dt)
+            d[:, 0:2] += d[:, 2:4] * dt
+            d[:, 4] -= dt
+            inner = np.hypot(d[:, 0], d[:, 1]) < RS * 0.95
+            d[inner, 4] = np.minimum(d[inner, 4], 0.2)          # 落进盘内圈：很快消失
+            self.debris = d[d[:, 4] > 0]
+            busy = True
         if len(self.dust):                      # 晶尘：慢慢飘散、减速，寿命到了就去掉
             d = self.dust
             d[:, 0:2] += d[:, 2:4] * dt
