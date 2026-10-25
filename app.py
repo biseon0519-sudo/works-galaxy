@@ -1,95 +1,20 @@
-# 年度作品：按年份记录每年喜欢的作品（音乐、小说、综艺……），可以从 MarginNote 导出的导图导入
+# 年度作品：按年份记录每年喜欢的作品（音乐、小说、综艺……），放射状思维导图显示；可以从 MarginNote 导出的导图导入
 import os, sys, threading, datetime, traceback
-from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QIcon, QFontDatabase
-from PySide6.QtWidgets import QApplication, QHBoxLayout, QVBoxLayout, QWidget, QFileDialog, QListWidgetItem
+from PySide6.QtWidgets import QApplication, QHBoxLayout, QWidget, QFileDialog
 if __name__ == '__main__' and QApplication.instance() is None:
     # 启动提速（同抽卡统计）：先建好 QApplication，让后台线程去扫系统字体，和下面导入界面库同时进行
     _app = QApplication(sys.argv)
     threading.Thread(target=QFontDatabase.families, daemon=True).start()
-from qfluentwidgets import (CaptionLabel, StrongBodyLabel, TitleLabel, PushButton, PrimaryPushButton, SmoothScrollArea,
-                            ListWidget, InfoBar, InfoBarPosition, MessageBoxBase, SubtitleLabel, SpinBox, MessageBox,
-                            TransparentToolButton, RoundMenu, Action, FlowLayout, ToolTipFilter, ToolTipPosition,
-                            FluentIcon as FIF, qconfig)
+from qfluentwidgets import (CaptionLabel, PushButton, InfoBar, InfoBarPosition, MessageBoxBase, SubtitleLabel, SpinBox,
+                            MessageBox, ToolTipFilter, ToolTipPosition, FluentIcon as FIF, setTheme, setThemeColor, Theme)
 import store, marginnote
-from widgets import WorkCard, EditDialog
+from widgets import EditDialog
+from mindmap import MindMap
 from fluent_ui import make_app, Window, show_window, single_instance
 
-VERSION = '2026.10.24'                    # 日历版本号：发布当天的日期，同一天再发就加 .1、.2
-
-
-def caption(text=''):
-    lb = CaptionLabel(text)
-    lb.setTextColor(QColor(0, 0, 0, 150), QColor(255, 255, 255, 160))
-    return lb
-
-
-def scroll_of(widget):
-    s = SmoothScrollArea(); s.setWidgetResizable(True); s.setWidget(widget)
-    s.setStyleSheet('QScrollArea{background:transparent;border:none}')
-    # 只透明这一层：不带选择器的 background:transparent 会传给里面的提示框，提示框就变成一个黑框
-    widget.setObjectName('scrollBody')
-    widget.setStyleSheet('#scrollBody{background:transparent}')
-    return s
-
-
-class YearPage(QWidget):
-    """右边：一年的作品，按分类分组。每个分类一行标题（名字 · 个数 · ＋），下面是作品卡片。"""
-
-    def __init__(self, app):
-        super().__init__()
-        self.app = app
-        self.v = QVBoxLayout(self)
-        self.v.setContentsMargins(4, 0, 12, 16); self.v.setSpacing(6)
-
-    def clear(self):
-        while self.v.count():
-            it = self.v.takeAt(0)
-            if it.widget():
-                it.widget().deleteLater()
-            elif it.layout():
-                self._drop_layout(it.layout())
-
-    def _drop_layout(self, lay):
-        while lay.count():
-            it = lay.takeAt(0)
-            if it.widget():
-                it.widget().deleteLater()
-            elif it.layout():
-                self._drop_layout(it.layout())
-        lay.deleteLater()
-
-    def show_year(self, doc, year):
-        self.clear()
-        works = [w for w in doc['works'] if w['year'] == year]
-        head = QHBoxLayout(); head.setSpacing(12)
-        head.addWidget(TitleLabel(f'{year} 年度作品'))
-        head.addWidget(caption(f'{len(works)} 个' if works else '还没有作品'), 0, Qt.AlignBottom)
-        head.addStretch(1)
-        self.v.addLayout(head)
-        self.v.addSpacing(6)
-        for cat in doc['categories']:
-            items = [w for w in works if w['category'] == cat]
-            row = QHBoxLayout(); row.setSpacing(8)
-            row.addWidget(StrongBodyLabel(cat))
-            row.addWidget(caption(str(len(items)) if items else ''))
-            add = TransparentToolButton(FIF.ADD); add.setFixedSize(28, 28)
-            add.setToolTip(f'添加{cat}'); add.installEventFilter(ToolTipFilter(add, 300, ToolTipPosition.TOP))
-            add.clicked.connect(lambda *_, c=cat: self.app.add_work(year, c))
-            row.addWidget(add); row.addStretch(1)
-            self.v.addLayout(row)
-            if items:
-                box = QWidget()
-                flow = FlowLayout(box, needAni=False)
-                flow.setContentsMargins(0, 0, 0, 0); flow.setHorizontalSpacing(14); flow.setVerticalSpacing(14)
-                for w in items:
-                    card = WorkCard(w)
-                    card.clicked.connect(self.app.edit_work)
-                    card.menuRequested.connect(self.app.work_menu)
-                    flow.addWidget(card)
-                self.v.addWidget(box)
-                self.v.addSpacing(10)
-        self.v.addStretch(1)
+VERSION = '2026.10.25'                    # 日历版本号：发布当天的日期，同一天再发就加 .1、.2
+ACCENT = '#29c4f6'                        # 导图是深色霓虹风，界面固定用深色 + 青色主题色
 
 
 class YearDialog(MessageBoxBase):
@@ -113,74 +38,62 @@ class App(Window):
         if not self.doc['years']:
             self.doc['years'] = [datetime.date.today().year]
 
-        top = QHBoxLayout(); top.setSpacing(8)
-        self.status = caption()
+        self.body.setContentsMargins(0, 0, 0, 0)       # 导图铺满整个窗口（标题栏底下也是星空）
+        self.map = MindMap(self)
+        self.body.addWidget(self.map)
+        self.map.editWork.connect(self.edit_work)
+        self.map.deleteWork.connect(self.delete_work)
+        self.map.addWork.connect(self.add_work)
+        self.map.addYear.connect(self.add_year)
+        self.map.deleteYear.connect(self.delete_year)
+
+        # 浮在导图上的按钮和提示
+        self.tools = QWidget(self)
+        h = QHBoxLayout(self.tools); h.setContentsMargins(0, 0, 0, 0); h.setSpacing(8)
         btn_import = PushButton(FIF.DOWNLOAD, '从 MarginNote 导入')
         btn_import.setToolTip('在 MarginNote 里用「导出到 OmniOutliner」导出，选那个 xml 文件')
         btn_import.installEventFilter(ToolTipFilter(btn_import, 300, ToolTipPosition.BOTTOM))
         btn_import.clicked.connect(self.import_marginnote)
-        btn_year = PrimaryPushButton(FIF.ADD, '添加年份')
+        btn_year = PushButton(FIF.ADD, '添加年份')
         btn_year.clicked.connect(self.add_year)
-        top.addWidget(self.status, 1); top.addWidget(btn_import); top.addWidget(btn_year)
-        self.body.addLayout(top)
+        h.addWidget(btn_import); h.addWidget(btn_year)
+        self.tools.adjustSize()
+        self.hint = CaptionLabel('点年份展开 · 点分类收起 · 滚轮缩放 · 拖动平移 · 双击空白处对准 · 右键更多', self)
+        self.hint.setTextColor(QColor(255, 255, 255, 110), QColor(255, 255, 255, 110))
+        self.hint.adjustSize()
+        self.titleBar.raise_()
 
-        main = QHBoxLayout(); main.setSpacing(12)
-        self.years = ListWidget()
-        self.years.setFixedWidth(150)
-        self.years.currentItemChanged.connect(lambda *_: self.show_current())
-        self.years.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.years.customContextMenuRequested.connect(self.year_menu)
-        main.addWidget(self.years)
-        self.page = YearPage(self)
-        main.addWidget(scroll_of(self.page), 1)
-        self.body.addLayout(main, 1)
+        self.map.set_doc(self.doc, expand=self.settings.get('year'), first=True)
 
-        qconfig.themeChanged.connect(lambda *_: self.page.update())
-        self.fill_years(self.settings.get('year'))
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if not hasattr(self, 'hint'):        # 父类初始化时就会触发 resize，那时还没建好
+            return
+        self.tools.move(self.width() - self.tools.width() - 16, self.titleBar.height() + 8)
+        self.hint.move(18, self.height() - self.hint.height() - 12)
 
-    # ---------- 显示 ----------
-    def fill_years(self, select=None):
-        cur = select if select is not None else self.current_year()
-        self.years.blockSignals(True)
-        self.years.clear()
-        counts = {}
-        for w in self.doc['works']:
-            counts[w['year']] = counts.get(w['year'], 0) + 1
-        row = 0
-        for i, y in enumerate(self.doc['years']):
-            it = QListWidgetItem(f'{y}' + (f'　·　{counts[y]}' if y in counts else ''))
-            it.setData(Qt.UserRole, y)
-            self.years.addItem(it)
-            if y == cur:
-                row = i
-        self.years.blockSignals(False)
-        if self.years.count():
-            self.years.setCurrentRow(row)
-        self.show_current()
-        self.status.setText(f'共 {len(self.doc["works"])} 个作品，{len(self.doc["years"])} 年')
+    def showEvent(self, e):
+        super().showEvent(e)
+        self.map.fit(animate=False)          # 窗口真正显示出来、尺寸定了再对准一次
 
-    def current_year(self):
-        it = self.years.currentItem()
-        return it.data(Qt.UserRole) if it else None
-
-    def show_current(self):
-        y = self.current_year()
-        if y is not None:
-            self.page.show_year(self.doc, y)
-
-    def save(self, select=None):
+    def save(self, expand=None):
         store.save(self.doc)
-        self.fill_years(select)
+        self.map.set_doc(self.doc)
+        if expand is not None and expand != self.map.expanded:
+            self.map.expand(expand)
+        else:
+            self.map.fit()
 
     # ---------- 作品 ----------
     def find(self, wid):
         return next((w for w in self.doc['works'] if w['id'] == wid), None)
 
     def add_work(self, year, category):
-        w = store.new_work(year, category)
+        w = store.new_work(year, category or self.doc['categories'][0])
         d = EditDialog(self, w, self.doc, True)
         if d.exec():
             self.doc['works'].append(w)
+            self.map.collapsed.discard((w['year'], w['category']))
             self.save(w['year'])
 
     def edit_work(self, wid):
@@ -190,7 +103,7 @@ class App(Window):
         backup = dict(w)
         d = EditDialog(self, w, self.doc, False)
         if d.exec():
-            self.save(w['year'] if w['year'] != backup['year'] else None)
+            self.save(w['year'])
         elif d.deleted:
             self.delete_work(wid, ask=False)
         else:
@@ -214,28 +127,6 @@ class App(Window):
         self.doc['works'].remove(w)
         self.save()
 
-    def move_work(self, wid, step):
-        """在同一年同一分类里往前 / 往后挪一格。"""
-        w = self.find(wid)
-        works = self.doc['works']
-        same = [i for i, x in enumerate(works) if x['year'] == w['year'] and x['category'] == w['category']]
-        k = same.index(works.index(w)) + step
-        if 0 <= k < len(same):
-            i, j = works.index(w), same[k]
-            works[i], works[j] = works[j], works[i]
-            self.save()
-
-    def work_menu(self, wid, pos):
-        menu = RoundMenu(parent=self)
-        for icon, text, fn in ((FIF.EDIT, '编辑', lambda: self.edit_work(wid)),
-                               (FIF.LEFT_ARROW, '往前挪', lambda: self.move_work(wid, -1)),
-                               (FIF.RIGHT_ARROW, '往后挪', lambda: self.move_work(wid, 1)),
-                               (FIF.DELETE, '删除', lambda: self.delete_work(wid))):
-            a = Action(icon, text, self)
-            a.triggered.connect(fn)
-            menu.addAction(a)
-        menu.exec(pos)
-
     # ---------- 年份 ----------
     def add_year(self):
         d = YearDialog(self, max(self.doc['years'], default=datetime.date.today().year - 1) + 1)
@@ -245,21 +136,13 @@ class App(Window):
                 self.doc['years'].append(y)
             self.save(y)
 
-    def year_menu(self, pos):
-        it = self.years.itemAt(pos)
-        if it is None:
-            return
-        y = it.data(Qt.UserRole)
-        menu = RoundMenu(parent=self)
-        a = Action(FIF.DELETE, f'删除 {y} 年', self)
-        a.triggered.connect(lambda: self.delete_year(y))
-        menu.addAction(a)
-        menu.exec(self.years.viewport().mapToGlobal(pos))
-
     def delete_year(self, y):
         if any(w['year'] == y for w in self.doc['works']):
             InfoBar.warning('删不了', f'{y} 年里还有作品，先把作品删掉或改到别的年份',
                             duration=4000, position=InfoBarPosition.TOP, parent=self)
+            return
+        if len(self.doc['years']) == 1:
+            InfoBar.warning('删不了', '至少要留一个年份', duration=3000, position=InfoBarPosition.TOP, parent=self)
             return
         self.doc['years'].remove(y)
         self.save()
@@ -285,7 +168,8 @@ class App(Window):
                         duration=5000, position=InfoBarPosition.TOP, parent=self)
 
     def closeEvent(self, e):
-        self.settings.update(year=self.current_year(), size=[self.width(), self.height()])
+        self.map.popup.hide()
+        self.settings.update(year=self.map.expanded, size=[self.width(), self.height()])
         store.save_settings(self.settings)
         super().closeEvent(e)
 
@@ -311,6 +195,8 @@ def main():
     if getattr(sys, 'frozen', False) and sys.stderr is None:
         sys.stdout = sys.stderr = ErrorLog()
     app = make_app()
+    setTheme(Theme.DARK)
+    setThemeColor(ACCENT)
     win = None
     if not single_instance('yearly-works', lambda: win):
         return

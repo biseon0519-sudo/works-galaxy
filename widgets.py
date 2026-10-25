@@ -1,5 +1,5 @@
-# 作品卡片、评分星星、封面框、编辑对话框
-import os, math, hashlib
+# 评分星星、封面框、编辑对话框（导图里点作品弹出来的）
+import os, math
 from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QSize
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPixmap, QImage, QFont, QPolygonF, QPen, QKeySequence
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QApplication, QFileDialog, QSizePolicy
@@ -8,24 +8,8 @@ from qfluentwidgets import (MessageBoxBase, SubtitleLabel, LineEdit, ComboBox, P
                             FluentIcon as FIF, isDarkTheme, themeColor)
 import store
 
-CARD_W = 128
-COVER_H = {'音乐': CARD_W}            # 音乐用方形（专辑封面），其他分类用 3:4 竖版
-TEXT_H = 50                           # 封面下面：名字、作者、星星三行
 STAR_GOLD = QColor('#e3a21a')
-PALETTE = {'文学作品': '#8a6d3b', '音乐': '#cf4f74', '小说': '#5468d4', '电视剧': '#2a8a7e', '电影': '#c4572e',
-           '动漫': '#d9831a', '综艺': '#8e5fd6', '鬼畜/梗': '#46963a', '游戏': '#2b7bd0'}
-EXTRA = ['#9a5b8c', '#3f8aa6', '#a6763f', '#5f7d3a', '#7a6ad0']
 IMAGE_FILTER = '图片 (*.png *.jpg *.jpeg *.webp *.bmp *.gif)'
-
-
-def category_color(cat):
-    if cat in PALETTE:
-        return QColor(PALETTE[cat])
-    return QColor(EXTRA[int(hashlib.md5(cat.encode()).hexdigest(), 16) % len(EXTRA)])
-
-
-def cover_height(cat):
-    return COVER_H.get(cat, round(CARD_W * 4 / 3))
 
 
 def text_color(alpha=255):
@@ -69,80 +53,6 @@ def draw_stars(p, x, cy, size, gap, value, empty):
     for i in range(store.MAX_RATING):
         p.setBrush(STAR_GOLD if i < value else empty)
         p.drawPath(star_path(x + i * (size + gap) + size / 2, cy, size / 2))
-
-
-def draw_placeholder(p, rect, work, radius):
-    """没封面：分类颜色的底 + 作品名，像一本书的封面。"""
-    c = category_color(work['category'])
-    p.setPen(Qt.NoPen); p.setBrush(c)
-    p.drawRoundedRect(rect, radius, radius)
-    p.setPen(QColor(255, 255, 255, 235))
-    f = QFont(p.font()); f.setPixelSize(15); f.setBold(True); p.setFont(f)
-    inner = rect.adjusted(10, 10, -10, -10)
-    p.drawText(inner, Qt.AlignCenter | Qt.TextWrapAnywhere, work['title'])
-
-
-class WorkCard(QWidget):
-    clicked = Signal(str)
-    menuRequested = Signal(str, object)
-
-    def __init__(self, work, parent=None):
-        super().__init__(parent)
-        self.work = work
-        self.hover = False
-        self.cover_h = cover_height(work['category'])
-        self.setFixedSize(CARD_W, self.cover_h + TEXT_H)
-        self.setCursor(Qt.PointingHandCursor)
-        tip = work['title'] + (f'（{work["author"]}）' if work['author'] else '')
-        if work['comment']:
-            tip += '\n' + work['comment']
-        self.setToolTip(tip)
-        self.installEventFilter(ToolTipFilter(self, 400, ToolTipPosition.TOP))
-
-    def enterEvent(self, e):
-        self.hover = True; self.update()
-
-    def leaveEvent(self, e):
-        self.hover = False; self.update()
-
-    def mouseReleaseEvent(self, e):
-        if e.button() == Qt.LeftButton and self.rect().contains(e.position().toPoint()):
-            self.clicked.emit(self.work['id'])
-
-    def contextMenuEvent(self, e):
-        self.menuRequested.emit(self.work['id'], e.globalPos())
-
-    def paintEvent(self, e):
-        p = QPainter(self)
-        p.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing | QPainter.SmoothPixmapTransform)
-        w = self.work
-        rect = QRectF(0, 0, CARD_W, self.cover_h)
-        radius = 8
-        path = store.cover_path(w)
-        pm = cover_pixmap(path, CARD_W, self.cover_h, self.devicePixelRatioF()) if path else None
-        if pm:
-            clip = QPainterPath(); clip.addRoundedRect(rect, radius, radius)
-            p.save(); p.setClipPath(clip); p.drawPixmap(0, 0, pm); p.restore()
-            p.setPen(QPen(text_color(25), 1)); p.setBrush(Qt.NoBrush)
-            p.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
-        else:
-            draw_placeholder(p, rect, w, radius)
-        if self.hover:
-            p.setPen(Qt.NoPen); p.setBrush(QColor(255, 255, 255, 40))
-            p.drawRoundedRect(rect, radius, radius)
-
-        y = self.cover_h + 4
-        f = QFont(self.font()); f.setPixelSize(13); p.setFont(f)
-        p.setPen(text_color())
-        p.drawText(QRectF(2, y, CARD_W - 4, 18), Qt.AlignLeft | Qt.AlignVCenter,
-                   p.fontMetrics().elidedText(w['title'], Qt.ElideRight, CARD_W - 4))
-        f.setPixelSize(11); p.setFont(f)
-        p.setPen(text_color(140))
-        if w['author']:
-            p.drawText(QRectF(2, y + 17, CARD_W - 4, 15), Qt.AlignLeft | Qt.AlignVCenter,
-                       p.fontMetrics().elidedText(w['author'], Qt.ElideRight, CARD_W - 4))
-        if w['rating']:
-            draw_stars(p, 2, y + 39, 10, 2.4, w['rating'], text_color(35))
 
 
 class StarRating(QWidget):
