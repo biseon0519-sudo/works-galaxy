@@ -23,10 +23,10 @@ DISK_COLOR = QColor('#ffb36b')        # 黑洞吸积盘的颜色，中心到年�
 SS = 2                    # 超采样倍数（内部按几倍分辨率画）
 MAX_TEX = 4096            # 内部画布最大边长
 RS = 34                   # 全图时黑洞阴影（看到的黑色圆）的半径（世界坐标）
-EL_MAP, EL_CINE = 0.28, 0.10          # 黑洞仰角（弧度）：全图稍微斜着看；展开时几乎侧视，像飞船飞到黑洞旁边
+EL_MAP, EL_CINE = 0.22, 0.10          # 黑洞仰角（弧度）：全图稍微斜着看；展开时几乎侧视，像飞船飞到黑洞旁边
 CINE_X, CINE_SHADOW = 0.15, 0.10      # 展开时黑洞在画面左边的位置（占宽度的比例）、阴影半径（占高度的比例）
 CINE_ROLL = -0.10         # 展开时黑洞稍微歪一点，更有镜头感
-DISK_OUT = 8.6            # 吸积盘外缘（以视界半径为单位，和着色器里的 R_OUT 一致）
+DISK_OUT = 6.2            # 吸积盘外缘（以视界半径为单位，和着色器里的 R_OUT 一致）
 SWALLOW_MS, BIRTH_MS = 1300, 1000     # 收起时被黑洞吞掉、展开时从黑洞里螺旋飞出的动画时长
 ROPE_LAG, ROPE_K, ROPE_D = 0.5, 22.0, 6.0     # 分支光丝的惯性：端点动时控制点只跟上一部分，再靠弹簧追上
 STAR_R = 21               # 恒星半径
@@ -194,13 +194,21 @@ uniform float u_time;
 in vec2 v_local; flat in vec4 v_color; flat in vec4 v_p1; flat in vec4 v_p2;
 out vec4 f;
 ''' + NOISE + '''
-const float R_IN = 2.3, R_OUT = 8.6;
+const float R_IN = 2.3, R_OUT = 6.2;
 vec4 disk(vec3 hit, float rr, vec3 v){
     float phi = atan(hit.z, hit.x);
-    float a = phi - u_time * 1.6 * pow(rr, -1.5);          // 内圈转得快
-    vec2 pp = vec2(cos(a), sin(a)) * rr;
-    float n = fbm(pp * 0.9 + vec2(rr * 0.6, 0.0));
-    float streak = fbm(pp * 0.35 + vec2(rr * 1.5, 3.0));    // 大尺度的明暗起伏
+    // 内圈转得快、外圈转得慢。不能直接用 时间 × 转速：时间一长内外圈转过的角度差越来越大，纹理被拧成一圈圈细线。
+    // 改用两层纹理交替（流动贴图）：每层只转 T 秒就重置，两层错开半个周期，重置时那层刚好完全淡出，看不出跳变
+    const float PERIOD = 6.0;
+    float w = 1.6 * pow(rr, -1.5);
+    float ph1 = fract(u_time / PERIOD), ph2 = fract(u_time / PERIOD + 0.5);
+    float a1 = phi - w * ph1 * PERIOD, a2 = phi - w * ph2 * PERIOD;
+    vec2 pp1 = vec2(cos(a1), sin(a1)) * rr + 7.3 * floor(u_time / PERIOD);           // 每次重置换一块纹理，不重复
+    vec2 pp2 = vec2(cos(a2), sin(a2)) * rr + 7.3 * floor(u_time / PERIOD + 0.5) + 3.7;
+    float mixw = abs(1.0 - 2.0 * ph1);                     // 第一层重置时（ph1 = 0）只看第二层
+    float n = mix(fbm(pp1 * 0.9 + vec2(rr * 0.6, 0.0)), fbm(pp2 * 0.9 + vec2(rr * 0.6, 0.0)), mixw);
+    n = clamp((n - 0.5) * 1.5 + 0.5, 0.0, 1.0);             // 两层混合会把明暗抵消掉一些，补回对比度
+    float streak = mix(fbm(pp1 * 0.35 + vec2(rr * 1.5, 3.0)), fbm(pp2 * 0.35 + vec2(rr * 1.5, 3.0)), mixw);    // 大尺度的明暗起伏
     float x = (rr - R_IN) / (R_OUT - R_IN);
     float T = pow(R_IN / rr, 0.9);                          // 越靠里越热
     vec3 base = mix(vec3(0.95, 0.28, 0.06), vec3(1.0, 0.78, 0.45), T);
@@ -209,8 +217,8 @@ vec4 disk(vec3 hit, float rr, vec3 v){
     float beta = sqrt(0.5 / rr);
     float dop = sqrt(1.0 - beta * beta) / (1.0 - beta * dot(vel, -v));     // 朝我们转来的一侧更亮
     float g = sqrt(max(0.0, 1.0 - 1.0 / rr));               // 引力红移
-    float I = (pow(dop * g, 2.5) + 0.15) * pow(R_IN / rr, 0.7) * 1.5;
-    float edge = smoothstep(0.0, 0.06, x) * (1.0 - smoothstep(0.55, 1.0, x));
+    float I = (pow(dop * g, 2.5) + 0.15) * pow(R_IN / rr, 1.2) * 1.6;
+    float edge = smoothstep(0.0, 0.06, x) * (1.0 - smoothstep(0.35, 1.0, x));
     float dens = edge * (0.45 + 0.75 * n) * (0.92 + 0.16 * streak);     // 平滑的气体湍流（加细环会显得一条条的）
     return vec4(base * I * 3.0, clamp(dens * min(I * 1.5, 1.0), 0.0, 0.95));
 }
@@ -242,6 +250,7 @@ void main(){
                 float rr = length(hit.xz);
                 if (rr > R_IN && rr < R_OUT){
                     vec4 e = disk(hit, rr, normalize(v));
+                    if (v.y > 0.0) e *= vec4(0.3, 0.3, 0.3, 0.45);     // 光线从下面穿上来 = 看到的是盘的底面（黑洞下方那道弧），压暗压细
                     col += (1.0 - alpha) * e.rgb * e.a;
                     alpha += (1.0 - alpha) * e.a;
                 }
@@ -807,6 +816,11 @@ class MindMap(QOpenGLWidget):
             c.sy = lerp(c.sy, self.height() * 0.5, e)
             c.rpx = lerp(RS * self.cam_s, self.height() * CINE_SHADOW, e)
             self.bh = (c.sx, c.sy, c.rpx, lerp(EL_MAP, EL_CINE, e), CINE_ROLL * e)
+            if e > 0:                           # 展开时其他年份退到屏幕左边外面，只留它们流进黑洞的物质流
+                for n in self.nodes.values():
+                    if n.kind == 'year' and not n.active:
+                        n.sx = lerp(n.sx, -90 - 160 * n.bob[0] / 0.22, e)
+                        n.sy = lerp(n.sy, self.height() * (0.06 + 0.88 * n.seed), e)
 
     # ---------- 镜头 ----------
     def fit(self, animate=True):
@@ -842,7 +856,18 @@ class MindMap(QOpenGLWidget):
         self.cam_c = QPointF(lerp(c0.x(), c1.x(), t), lerp(c0.y(), c1.y(), t))
         self.update()
 
+    def fixed_view(self):
+        """展开某一年时是固定视角（黑洞在左边、分支在右边），不能拖动缩放；回到全图才可以。"""
+        return self._cine_target() > 0.5
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self.fixed_view() and self.doc is not None:
+            self.fit(animate=False)
+
     def wheelEvent(self, e):
+        if self.fixed_view():
+            return
         self.cam.stop()
         m = e.position()
         before = self.unproject(m.x(), m.y())
@@ -1212,7 +1237,7 @@ class MindMap(QOpenGLWidget):
         pos = e.position()
         if self._press:
             d = pos - self._press[0]
-            if not self._press[1] and abs(d.x()) + abs(d.y()) > 5:
+            if not self._press[1] and abs(d.x()) + abs(d.y()) > 5 and not self.fixed_view():
                 self._press = (self._press[0], True, self._press[2])     # 在拖动画布
                 self.setCursor(Qt.ClosedHandCursor)
                 self._set_hover(None)
