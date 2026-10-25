@@ -66,6 +66,11 @@ def lerp(a, b, t):
     return a + (b - a) * t
 
 
+def smooth(a, b, x):
+    t = max(0.0, min(1.0, (x - a) / (b - a)))
+    return t * t * (3 - 2 * t)
+
+
 def wrap_angle(a):
     return (a + math.pi) % (2 * math.pi) - math.pi
 
@@ -285,7 +290,7 @@ void main(){
     if (doom > 0.0){                                        // 被黑洞吞掉：顺着运动方向拉长、变红
         vec2 dd = vec2(cos(dang), sin(dang));
         float al = dot(q, dd);
-        q += dd * (al / (1.0 + 2.5 * doom) - al);
+        q += dd * (al / (1.0 + 1.5 * doom) - al);
         c = mix(c, vec3(1.0, 0.25, 0.08), doom * 0.8);
     }
     float r = length(q);
@@ -295,7 +300,7 @@ void main(){
     float gran = fbm(q * 3.2 / (0.6 + mu) + vec2(u_time * 0.04, seed * 13.0));
     vec3 surf = mix(c, vec3(1.0), 0.3 * mu) * (0.55 + 0.75 * limb) * (0.85 + 0.35 * gran) * 1.9;
     float lift = (0.8 + 0.45 * hv + 0.35 * act) * bright * (0.92 + 0.08 * sin(u_time * 1.6 + seed * 20.0));
-    lift *= 1.0 + 4.0 * smoothstep(0.8, 0.95, doom);        // 掉进去前最后亮一下
+    lift *= 1.0 + 2.2 * exp(-pow((doom - 0.82) / 0.1, 2.0));   // 落进盘里那一下亮一下
     float corona = exp(-max(r - 1.0, 0.0) * 1.7) * 1.1 + exp(-max(r - 1.0, 0.0) * 0.6) * 0.18;
     vec3 em = c * corona * lift * (1.0 - smoothstep(3.2, 4.9, max(abs(q0.x), abs(q0.y))));   // 画到方块边缘前淡掉
     vec3 col = surf * body * (0.8 + 0.3 * lift) + em * (1.0 - body * 0.6);
@@ -304,33 +309,51 @@ void main(){
 }
 '''
 
-# 胶囊（分类、作品、添加按钮）：深色玻璃身体 + 顶上一道高光 + 彩色描边，朝向光源的一侧描边更亮，外面一圈柔光
+# 胶囊（分类、作品、添加按钮）：半透明的黑水晶——深色晶体能隐约透出后面的星空，几个切面明暗不同、切面之间有细亮的棱，
+# 边缘内侧一圈折射般的亮边，顶上一道锐利的高光，偶尔有一道反光扫过；朝向父节点那侧的描边被照亮
 PILL_FS = '''
 #version 330
+uniform float u_time;
 in vec2 v_local; flat in vec4 v_color; flat in vec4 v_p1; flat in vec4 v_p2;
 out vec4 f;
+''' + NOISE + '''
 float sd(vec2 p, vec2 b){ float r = b.y; vec2 q = abs(p) - b + r; return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r; }
 void main(){
     vec2 b = v_p1.xy; float hv = v_p1.z, op = v_p1.w;
-    vec2 L = v_p2.xy; float kind = v_p2.w;
+    vec2 L = v_p2.xy; float seed = v_p2.z, kind = v_p2.w;
     vec3 c = v_color.rgb;
     vec2 p = v_local;
     float d = sd(p, b);
     vec2 n = normalize(vec2(sd(p + vec2(0.5, 0), b) - sd(p - vec2(0.5, 0), b), sd(p + vec2(0, 0.5), b) - sd(p - vec2(0, 0.5), b)) + 1e-5);
     float inside = 1.0 - smoothstep(-0.6, 0.6, d);
+    vec2 fp = p / b.y;                                      // 以半高为单位
+    // 切面：两组斜线把晶体切成几块，每块明暗不同（角度按 seed 变化，每个胶囊不一样）
+    float k1 = 0.45 + 0.3 * seed, k2 = 0.9 - 0.3 * seed;
+    float u1 = fp.x * 0.18 + fp.y * k1 + seed * 3.0, u2 = fp.x * 0.14 - fp.y * k2 + seed * 7.0;
+    float facet = hash(vec2(floor(u1), floor(u2)) + seed * 17.0);
+    float g1 = fract(u1), g2 = fract(u2);
+    float ridge = (1.0 - smoothstep(0.0, fwidth(u1) * 1.3, min(g1, 1.0 - g1)))
+                + (1.0 - smoothstep(0.0, fwidth(u2) * 1.3, min(g2, 1.0 - g2)));
     float yN = clamp(p.y / b.y, -1.0, 1.0);
-    vec3 body = mix(vec3(0.075, 0.095, 0.21), vec3(0.025, 0.035, 0.10), yN * 0.5 + 0.5) + c * (0.07 + 0.08 * hv);
-    float spec = exp(-pow((d + 3.0) / 1.6, 2.0)) * smoothstep(0.1, -0.7, yN) * 0.28;
+    vec3 tint = mix(vec3(0.03, 0.04, 0.10), c * 0.30, 0.22 + 0.10 * hv);
+    vec3 body = tint * (0.7 + 0.5 * facet) * (1.15 - 0.35 * (yN * 0.5 + 0.5));
+    float bodyA = (kind > 1.5) ? 0.35 : 0.58;              // 半透明
+    // 发光的部分（加在上面，不挡后面的东西）
+    float rim = exp(min(d, 0.0) / 2.6) * inside;           // 边缘内侧折射般的亮边
+    float spec = exp(-pow((yN + 0.62) / 0.13, 2.0)) * (1.0 - smoothstep(0.55, 1.0, abs(p.x) / b.x)) * inside;   // 顶上的高光
+    float sweepX = (fract(u_time * 0.07 + seed) * 3.0 - 1.0) * b.x * 1.4;
+    float glint = exp(-pow((p.x - sweepX + p.y * 0.8) / 5.0, 2.0)) * inside;      // 偶尔扫过的一道反光
+    vec3 emit = c * (rim * 0.55 + ridge * 0.12 * inside) + vec3(rim * 0.12 + spec * 0.32 + glint * 0.16 + ridge * 0.04 * inside);
+    // 描边和外面的柔光
     float facing = max(0.0, dot(n, L));
     float border = exp(-pow(d / 0.9, 2.0));
     if (kind > 1.5) border *= step(0.45, fract(atan(p.y, p.x) * 10.0 / 6.2832 + 0.25));    // 添加按钮：虚线圈
-    vec3 bcol = c * (0.55 + 1.0 * facing + 0.7 * hv);
+    vec3 bcol = c * (0.5 + 1.0 * facing + 0.7 * hv);
     float out_ = max(d, 0.0);
-    float glow = (exp(-out_ / (4.0 + 3.0 * hv)) * (0.16 + 0.30 * hv) + exp(-out_ / 14.0) * 0.06) * (1.0 - inside)
+    float glow = (exp(-out_ / (4.0 + 3.0 * hv)) * (0.14 + 0.30 * hv) + exp(-out_ / 14.0) * 0.05) * (1.0 - inside)
                * (1.0 - smoothstep(18.0, 29.0, out_));
-    float bodyA = (kind > 1.5) ? 0.75 : 0.9;
-    vec3 col = (body + vec3(spec)) * inside * bodyA + bcol * border + c * glow;
-    float alpha = clamp(inside * bodyA + border * 0.4, 0.0, 1.0);
+    vec3 col = body * inside * bodyA + emit * (1.0 + 0.6 * hv) + bcol * border + c * glow;
+    float alpha = clamp(inside * bodyA + border * 0.35, 0.0, 1.0);
     f = vec4(col * op, alpha * op);
 }
 '''
@@ -386,6 +409,25 @@ void main(){
         col = v_color.rgb * (haze + pt * 1.3) + vec3(pt * 0.35);
     }
     f = vec4(col * v_color.a, 0.0);
+}
+'''
+
+# 晶尘：胶囊碎掉时迸出的菱形小碎屑，会闪，带一点十字闪光；加色混合
+DUST_FS = '''
+#version 330
+uniform float u_time;
+in vec2 v_local; flat in vec4 v_color; flat in vec4 v_p1; flat in vec4 v_p2;
+out vec4 f;
+void main(){
+    float s = v_p1.x, a = v_p1.y, ph = v_p1.z;
+    vec2 q = v_local / s;
+    float dia = abs(q.x) + abs(q.y);
+    float core = exp(-dia * dia * 1.2);
+    float tw = 0.55 + 0.45 * sin(u_time * 9.0 + ph * 40.0);
+    float spark = (exp(-abs(q.x) * 6.0) * exp(-abs(q.y) * 1.2) + exp(-abs(q.y) * 6.0) * exp(-abs(q.x) * 1.2)) * 0.35 * tw;
+    vec3 col = v_color.rgb * (core * 1.4 + spark) + vec3(core * 0.5 * tw);
+    float win = 1.0 - smoothstep(3.5, 5.0, max(abs(q.x), abs(q.y)));
+    f = vec4(col * a * win, 0.0);
 }
 '''
 
@@ -591,6 +633,8 @@ class MindMap(QOpenGLWidget):
         self.cine = 0.0                 # 0 = 全图（黑洞在中间、斜看），1 = 展开（黑洞在左边、侧视放大）
         self.bh = (-9999.0, -9999.0, 1.0, EL_MAP, 0.0)   # 这一帧黑洞在屏幕上的 x、y、阴影半径、仰角、滚转
         self._ropes = {}                # 分支光丝的惯性状态
+        # 晶尘粒子，每行：世界 x、y，速度 x、y，剩余寿命，总寿命，大小，颜色 r、g、b，闪烁相位
+        self.dust = np.zeros((0, 11), 'f4')
         self._rope_t = 0.0
 
         ease = QEasingCurve(QEasingCurve.OutBack); ease.setOvershoot(1.3)      # 展开时稍微冲过头再弹回来
@@ -709,6 +753,27 @@ class MindMap(QOpenGLWidget):
             self.branch_rect = QRectF(QPointF(r1 - 60, -total / 2 - 20), QPointF(right + 30, total / 2 + 20))
         return t
 
+    def _shatter(self, n):
+        """胶囊碎成晶尘：在胶囊范围里撒一把碎屑，往四周慢慢飘散，边闪边消失。"""
+        rng = np.random.default_rng()
+        cnt = int(max(30, min(150, n.w * n.h / 30)))
+        u = rng.random((cnt, 2))
+        x = n.base.x() + u[:, 0] * n.w
+        y = n.base.y() + (u[:, 1] - 0.5) * n.h
+        dx, dy = x - (n.base.x() + n.w / 2), y - n.base.y()
+        norm = np.hypot(dx, dy) + 1e-3
+        sp = rng.uniform(50, 170, cnt)                   # 一开始猛地炸开，阻力很快让它慢下来，然后慢慢飘
+        ang = rng.normal(0, 0.6, cnt)                    # 方向带点随机，不是整齐地往外
+        ux, uy = dx / norm, dy / norm
+        vx = (ux * np.cos(ang) - uy * np.sin(ang)) * sp + rng.normal(0, 18, cnt)
+        vy = (ux * np.sin(ang) + uy * np.cos(ang)) * sp * 0.8 + rng.normal(0, 18, cnt) - 8
+        life = rng.uniform(0.8, 1.6, cnt)
+        c = np.array([n.color.redF(), n.color.greenF(), n.color.blueF()])
+        wmix = rng.uniform(0, 0.6, (cnt, 1))
+        col = c * (1 - wmix) + wmix                      # 有的偏白，像水晶反光
+        new = np.column_stack([x, y, vx, vy, life, life, rng.uniform(0.5, 1.6, cnt), col, rng.random(cnt)]).astype('f4')
+        self.dust = np.concatenate([self.dust, new])
+
     def relayout(self, animate=True):
         targets = self._targets()
         for key, (kind, parent, text, sub, color, data, pos, polar, z) in targets.items():
@@ -742,8 +807,16 @@ class MindMap(QOpenGLWidget):
                 par = targets.get(node.parent_key)
                 P = par[6] if par else QPointF(0, 0)
                 d = node.base - P
-                node.swallow = (P, math.hypot(d.x(), d.y()), math.atan2(d.y(), d.x()),
-                                -2.3 * math.pi if node.kind == 'year' else -1.2 * math.pi)
+                r0, th0 = math.hypot(d.x(), d.y()), math.atan2(d.y(), d.x())
+                if node.kind == 'year':
+                    # 掉进黑洞：多转一两圈，最后落在吸积盘内圈朝我们转过来的那一侧（左边一片，各自错开），不压到黑色的视界上
+                    end = math.pi + (node.seed - 0.5) * 1.2
+                    sw = -(2 * math.pi + (th0 - end) % (2 * math.pi))
+                    node.swallow = (P, r0, th0, sw, RS * (1.4 + 0.7 * node.bob[1] / 0.4), True)
+                else:
+                    node.swallow = None             # 胶囊：原地碎成晶尘
+                    if animate:
+                        self._shatter(node)
                 node.z0, node.z1 = node.z, (par[8] if par else 0.0)
                 node.o0 = node.opacity
                 node.polar1 = None
@@ -762,14 +835,21 @@ class MindMap(QOpenGLWidget):
         tc = min(1.0, t)                        # 回弹曲线会超过 1：位置可以冲过头，透明度和远近不行
         raw = self.anim.currentTime() / max(1, self.anim.duration()) if self.anim.state() == QVariantAnimation.Running else 1.0
         for n in self.nodes.values():
+            if n.removing and n.swallow is None:      # 碎成晶尘的胶囊：很快淡掉
+                n.opacity = n.o0 * (1 - smooth(0.0, 0.18, raw))
+                continue
             if n.removing:
-                P, r0, th0, sw = n.swallow
-                e = raw ** 1.7                  # 越来越快
-                r, th = r0 * (1 - e), th0 + sw * e
-                n.base = QPointF(P.x() + r * math.cos(th), P.y() + r * math.sin(th))
-                n.doom, n.dang = e, th - math.pi / 2
-                n.z = lerp(n.z0, n.z1, e)
-                n.opacity = n.o0 * (1 - max(0.0, min(1.0, (e - 0.82) / 0.18)))
+                P, r0, th0, sw, r_end, into_hole = n.swallow
+                pr = raw * raw * (3 - 2 * raw)          # 半径：先慢、中间快、最后轻轻落进去
+                th = th0 + sw * raw ** 1.5              # 角度：越转越快
+                r = lerp(r0, r_end, pr)
+                sq = lerp(1.0, math.sin(EL_MAP), pr ** 1.5) if into_hole else 1.0    # 越靠近越被压到盘面上
+                n.base = QPointF(P.x() + r * math.cos(th), P.y() + r * math.sin(th) * sq)
+                n.doom, n.dang = raw, th - math.pi / 2
+                n.z = lerp(n.z0, n.z1, pr)
+                n.opacity = n.o0 * (1 - smooth(0.55, 1.0, raw))      # 后面一段慢慢淡出
+                if into_hole and math.sin(th) < 0:                    # 转到黑洞后面、在视界范围里：被挡住
+                    n.opacity *= smooth(RS * 0.75, RS * 1.1, math.hypot(r * math.cos(th), r * math.sin(th) * sq))
                 continue
             k = t
             if n.polar1 is not None and n.polar0 is not None:
@@ -885,7 +965,7 @@ class MindMap(QOpenGLWidget):
         self.v_sky = ctx.vertex_array(self.p_sky, [(quad, '2f', 'in_pos')])
         self.v_down = ctx.vertex_array(self.p_down, [(quad, '2f', 'in_pos')])
         self.sprites = {}
-        for name, fs in (('hole', HOLE_FS), ('star', STAR_FS), ('pill', PILL_FS)):
+        for name, fs in (('hole', HOLE_FS), ('star', STAR_FS), ('pill', PILL_FS), ('dust', DUST_FS)):
             prog = ctx.program(vertex_shader=SPRITE_VS, fragment_shader=fs)
             inst = ctx.buffer(reserve=16 * 4 * 256, dynamic=True)
             # 着色器里没用到的变量会被编译器去掉，绑定时要跳过（16x = 空出 16 个字节）
@@ -1021,12 +1101,15 @@ class MindMap(QOpenGLWidget):
                 continue
             gl = max(n.glow, 1.0 if n.active else 0.0)
             if n.kind == 'center':
+                feed = max((math.exp(-((m.doom - 0.9) / 0.12) ** 2) for m in self.nodes.values()
+                            if m.removing and m.kind == 'year'), default=0.0)
+                gl = max(gl, feed)
                 rs_px = n.rpx / 2.6                     # 看到的阴影比视界大 2.6 倍（光线被弯过来）
                 half = rs_px * 11
                 holes.append((n.sx, n.sy, half, half) + _rgba(n.color) + (rs_px, gl, n.opacity, half,
                                                                          self.bh[3], self.bh[4], 0, 0))
             elif n.kind == 'year':
-                R = STAR_R * n.k * (1 + 0.12 * n.glow + 0.15 * n.active) * (1 - 0.85 * n.doom)
+                R = STAR_R * n.k * (1 + 0.12 * n.glow + 0.15 * n.active) * (1 - 0.9 * n.doom)
                 bright = 0.75 + 0.25 * max(-1, min(1, n.z / 140))
                 stars.append((n.sx, n.sy, R * 5, R * 5) + _rgba(n.color) + (R, n.glow, n.opacity, 1.0 if n.active else 0.0,
                                                                                n.seed, bright, n.doom, n.dang))
@@ -1038,7 +1121,7 @@ class MindMap(QOpenGLWidget):
                 lx, ly = ((par.sx - cx), (par.sy - cy)) if par else (-1, 0)
                 ln = math.hypot(lx, ly) or 1
                 pills.append((cx, cy, hw + 30, hh + 30) + _rgba(n.color) + (hw, hh, gl, n.opacity,
-                                                                         lx / ln, ly / ln, 0, 2.0 if n.kind == 'add' else 0.0))
+                                                                         lx / ln, ly / ln, n.seed, 2.0 if n.kind == 'add' else 0.0))
         # 顺序：黑洞 → 连线（加色，叠在盘上汇进去）→ 恒星 → 胶囊
         for name, items in (('hole', holes), ('beam', None), ('star', stars), ('pill', pills)):
             if name == 'beam':
@@ -1058,6 +1141,23 @@ class MindMap(QOpenGLWidget):
             inst.write(data)
             self._set(prog, u_vp=(vw, vh), u_time=t)
             vao.render(moderngl.TRIANGLE_STRIP, instances=len(items))
+
+        if len(self.dust):
+            d = self.dust
+            sx = (d[:, 0] - self.cam_c.x()) * self.cam_s + vw / 2
+            sy = (d[:, 1] - self.cam_c.y()) * self.cam_s + vh / 2
+            size = np.maximum(0.6, d[:, 6] * min(1.6, self.cam_s))
+            a = (d[:, 4] / d[:, 5]) ** 0.7
+            z = np.zeros_like(sx)
+            inst = np.column_stack([sx, sy, size * 5, size * 5, d[:, 7], d[:, 8], d[:, 9], z + 1, size, a, d[:, 10], z, z, z, z, z])
+            prog, buf, vao = self.sprites['dust']
+            data = inst.astype('f4').tobytes()
+            if len(data) > buf.size:
+                buf.orphan(len(data) * 2)
+            buf.write(data)
+            ctx.blend_func = moderngl.ONE, moderngl.ONE
+            self._set(prog, u_vp=(vw, vh), u_time=t)
+            vao.render(moderngl.TRIANGLE_STRIP, instances=len(inst))
 
         # 缩小到屏幕（超采样）
         screen = ctx.detect_framebuffer(self.defaultFramebufferObject())
@@ -1095,6 +1195,7 @@ class MindMap(QOpenGLWidget):
                 p.setPen(QColor(255, 210, 170, 170)); p.setFont(font(12))
                 p.drawText(QRectF(-100, 24, 200, 18), Qt.AlignCenter, n.sub)
             elif n.kind == 'year':
+                p.setOpacity(n.opacity * (1 - smooth(0.15, 0.45, n.doom)))      # 被吞时文字先淡掉
                 p.translate(n.sx, n.sy + STAR_R * 1.35 * n.k * (1 + 0.15 * n.active)); p.scale(n.k, n.k)
                 p.setFont(font(17, True, DIGITS))
                 tw = p.fontMetrics().horizontalAdvance(n.text)
@@ -1160,6 +1261,13 @@ class MindMap(QOpenGLWidget):
                 if abs(n.glow - want) <= 0.005:
                     n.glow = want
             busy = busy or bool(n.v[0] or n.v[1]) or n.glow != want
+        if len(self.dust):                      # 晶尘：慢慢飘散、减速，寿命到了就去掉
+            d = self.dust
+            d[:, 0:2] += d[:, 2:4] * dt
+            d[:, 2:4] *= math.exp(-2.6 * dt)
+            d[:, 4] -= dt
+            self.dust = d[d[:, 4] > 0]
+            busy = True
         self.ticker.setInterval(1000 // (FPS_BUSY if busy else FPS_CALM))
         self.update()
 
