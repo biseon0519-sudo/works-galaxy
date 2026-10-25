@@ -1,6 +1,6 @@
 # 年度作品：按年份记录每年喜欢的作品（音乐、小说、综艺……），放射状思维导图显示；可以从 MarginNote 导出的导图导入
 import os, sys, threading, datetime, traceback
-from PySide6.QtGui import QColor, QIcon, QFontDatabase
+from PySide6.QtGui import QColor, QIcon, QFontDatabase, QGuiApplication, QCursor
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QWidget, QFileDialog
 if __name__ == '__main__' and QApplication.instance() is None:
     # 启动提速（同抽卡统计）：先建好 QApplication，让后台线程去扫系统字体，和下面导入界面库同时进行
@@ -32,8 +32,12 @@ class App(Window):
         super().__init__(f'年度作品  {VERSION}')
         self.setWindowIcon(QIcon(os.path.join(store.RES, 'icon.ico')))
         self.settings = store.load_settings()
-        self.resize(*self.settings.get('size', (1180, 800)))
         self.setMinimumSize(860, 600)
+        # 打开时居中：放在鼠标所在的屏幕正中间；上次的尺寸比屏幕还大时（换了小屏幕）先缩到放得下
+        scr = (QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()).availableGeometry()
+        w, h = self.settings.get('size', (1180, 800))
+        self.resize(min(w, scr.width()), min(h, scr.height()))
+        self.move(scr.center() - self.rect().center())
         self.doc = store.load()
         if not self.doc['years']:
             self.doc['years'] = [datetime.date.today().year]
@@ -75,6 +79,10 @@ class App(Window):
 
     def showEvent(self, e):
         super().showEvent(e)
+        if not getattr(self, '_centered', False):   # 第一次显示：按窗口实际大小再对一次中（无边框窗口显示后尺寸会略变）
+            self._centered = True
+            scr = (self.screen() or QGuiApplication.primaryScreen()).availableGeometry()
+            self.move(self.pos() + scr.center() - self.frameGeometry().center())
         self.map.fit(animate=False)          # 窗口真正显示出来、尺寸定了再对准一次
 
     def save(self, expand=None):
