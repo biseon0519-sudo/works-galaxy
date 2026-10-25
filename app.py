@@ -58,7 +58,7 @@ class App(Window):
         btn_year.clicked.connect(self.add_year)
         h.addWidget(btn_import); h.addWidget(btn_year)
         self.tools.adjustSize()
-        self.hint = CaptionLabel('点年份展开 · 点分类收起 · 滚轮缩放 · 拖动平移 · 双击空白处对准 · 右键更多', self)
+        self.hint = CaptionLabel('点年份展开 · 点中心收起全部 · 点分类收起 · 滚轮缩放 · 拖动平移 · 双击空白处对准 · 右键更多', self)
         self.hint.setTextColor(QColor(255, 255, 255, 110), QColor(255, 255, 255, 110))
         self.hint.adjustSize()
         self.titleBar.raise_()

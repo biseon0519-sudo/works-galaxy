@@ -1,10 +1,14 @@
 # 放射状思维导图：中心「年度作品」→ 一圈年份 → 点开的那一年转到右边，伸出分类 → 作品。
-# 深色星空背景 + 霓虹辉光。辉光按尺寸和颜色预先画好缓存，不用 QGraphicsDropShadowEffect（节点多了会卡）。
-import math, random
-from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QVariantAnimation, QEasingCurve, QTimer, QSize
+# 深色星空背景 + 霓虹辉光。辉光是高斯模糊按尺寸和颜色预先算好缓存的，不用 QGraphicsDropShadowEffect（节点多了会卡）。
+# 灵动感：每个节点自己慢慢漂浮，鼠标划过把附近的节点轻轻推开、再弹簧一样回来；悬停时慢慢变亮放大。
+import os, math, random
+import numpy as np
+from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QVariantAnimation, QEasingCurve, QTimer, QElapsedTimer
 from PySide6.QtGui import (QColor, QPainter, QPainterPath, QPixmap, QImage, QImageReader, QFont, QFontMetricsF, QPen,
                            QLinearGradient, QRadialGradient, QTransform, QCursor, QGuiApplication)
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsItem, QWidget
+from PySide6.QtOpenGLWidgets import QOpenGLWidget
+from PySide6.QtGui import QSurfaceFormat
 from qfluentwidgets import RoundMenu, Action, FluentIcon as FIF
 import store
 from widgets import cover_pixmap, draw_stars
@@ -17,7 +21,12 @@ CENTER_COLOR = QColor('#5ee7ff')
 
 LEAF, GROUP_GAP = 34, 18          # 展开的分支里：每个作品占的高度、分类之间多空的距离
 BEND = 0.00022                    # 分支的弧度：离中线越远越往回收一点，看起来是一段圆弧
-ANIM_MS = 650
+ANIM_MS = 700
+FPS_BUSY, FPS_CALM = 60, 30      # 有动画/鼠标扰动时 60 帧；只是慢慢漂浮时 30 帧就够了，省 CPU
+# 鼠标扰动像水里的气泡：推得很轻，慢慢漂回原位，几乎不来回晃（劲度小、阻尼接近临界）
+SPRING, DAMP, MAX_PUSH = 7.0, 5.0, 10.0
+PUSH_R = 80                       # 鼠标多近会推动节点
+PUSH_AWAY, PUSH_DRAG = 300.0, 0.4 # 鼠标附近的“水流力”：把节点推开、顺着鼠标方向带一下（按时间累积，划过一下大约挪 4~6 像素）
 
 
 def neon(cat):
@@ -40,24 +49,49 @@ def font(px, bold=False, family=FONT):
 _glow = {}
 
 
-def glow_pixmap(w, h, radius, color, spread):
-    """节点外的一圈辉光：一层层放大的圆角矩形叠起来，越靠近节点越亮。"""
-    key = (round(w), round(h), round(radius), color.rgb(), spread)
-    pm = _glow.get(key)
-    if pm is None:
-        img = QImage(int(w + 2 * spread + 2), int(h + 2 * spread + 2), QImage.Format_ARGB32_Premultiplied)
-        img.fill(Qt.transparent)
-        p = QPainter(img); p.setRenderHint(QPainter.Antialiasing); p.setPen(Qt.NoPen)
-        c = QColor(color)
-        for i in range(spread, 0, -1):
-            t = 1 - i / spread
-            c.setAlphaF(0.012 + 0.085 * t * t)
-            p.setBrush(c)
-            p.drawRoundedRect(QRectF(spread - i + 1, spread - i + 1, w + 2 * i, h + 2 * i), radius + i, radius + i)
-        p.end()
-        pm = QPixmap.fromImage(img)
-        _glow[key] = pm
-    return pm
+def _blur(a, sigma):
+    """可分离的高斯模糊（先横后竖）。"""
+    r = max(1, int(sigma * 3))
+    x = np.arange(-r, r + 1)
+    k = np.exp(-x * x / (2 * sigma * sigma)); k /= k.sum()
+    a = np.lib.stride_tricks.sliding_window_view(np.pad(a, ((0, 0), (r, r))), 2 * r + 1, axis=1) @ k
+    return np.lib.stride_tricks.sliding_window_view(np.pad(a, ((r, r), (0, 0))), 2 * r + 1, axis=0) @ k
+
+
+def glow_margin(sigma):
+    return int(math.ceil(sigma * 3)) + 2
+
+
+def glow_pixmap(w, h, radius, color, sigma):
+    """节点外的辉光：把节点形状做高斯模糊。一层贴身的亮光 + 一层很淡的大光晕，靠近节点的地方颜色偏白一点，像真的在发光。
+    返回 (图, 外边距)，图的 (外边距, 外边距) 处对齐节点左上角。"""
+    key = (round(w), round(h), round(radius), color.rgb(), sigma)
+    hit = _glow.get(key)
+    if hit is None:
+        m = glow_margin(sigma)
+        W, H = int(w) + 2 * m, int(h) + 2 * m
+        mask = QImage(W, H, QImage.Format_Grayscale8); mask.fill(0)
+        p = QPainter(mask); p.setRenderHint(QPainter.Antialiasing); p.setPen(Qt.NoPen); p.setBrush(QColor(255, 255, 255))
+        p.drawRoundedRect(QRectF(m, m, w, h), radius, radius); p.end()
+        a = np.frombuffer(mask.constBits(), np.uint8).reshape(H, mask.bytesPerLine())[:, :W] / 255.0
+        near, far = _blur(a, sigma * 0.33), _blur(a, sigma)
+        alpha = np.clip(near * 0.55 + far * 0.62, 0, 1)
+        white = np.clip(near * 0.35, 0, 1)[..., None]           # 贴身处偏白
+        rgb = np.array([color.blue(), color.green(), color.red()], float)
+        rgb = rgb * (1 - white) + 255 * white
+        out = np.empty((H, W, 4), np.uint8)
+        out[..., :3] = (rgb * alpha[..., None]).astype(np.uint8)  # 预乘 alpha
+        out[..., 3] = (alpha * 255).astype(np.uint8)
+        img = QImage(out.tobytes(), W, H, W * 4, QImage.Format_ARGB32_Premultiplied).copy()
+        hit = (QPixmap.fromImage(img), m)
+        _glow[key] = hit
+    return hit
+
+
+def bob(key):
+    """每个节点自己的漂浮节奏（按 key 固定，每次打开都一样）。"""
+    r = random.Random(key)
+    return r.uniform(0.5, 0.95), r.uniform(0.45, 0.85), r.uniform(0, 6.3), r.uniform(0, 6.3)
 
 
 def lerp(a, b, t):
@@ -71,7 +105,8 @@ def wrap_angle(a):
 class Node(QGraphicsItem):
     """导图节点。kind：center 中心 / year 年份 / cat 分类 / work 作品 / add 添加按钮。
     圆形节点（center、year、add）的 pos 是圆心；胶囊节点（cat、work）的 pos 是左端中点，往右伸。"""
-    SPREAD = {'center': 40, 'year': 24, 'cat': 18, 'work': 13, 'add': 12}
+    SIGMA = {'center': 30, 'year': 14, 'cat': 10, 'work': 7.5, 'add': 6}       # 辉光的模糊半径
+    AMP = {'center': 2.5, 'year': 4.0, 'cat': 3.2, 'work': 2.6, 'add': 2.2}      # 漂浮幅度
 
     def __init__(self, key, kind):
         super().__init__()
@@ -83,6 +118,12 @@ class Node(QGraphicsItem):
         self.data = None
         self.w = self.h = 0
         self.setZValue(2)
+        self.setCacheMode(QGraphicsItem.DeviceCoordinateCache)   # 画好的样子缓存起来，漂浮时只挪位置不重画
+        self.base = QPointF()           # 布局位置；实际位置 = base + 漂浮 + 鼠标扰动
+        self.bob = bob(key)
+        self.d, self.v = [0.0, 0.0], [0.0, 0.0]      # 鼠标扰动的偏移和速度（弹簧）
+        self.glow = 0.0                 # 悬停亮度 0~1，慢慢过渡
+        self.breath = 0.0               # 中心节点的呼吸 0~1
         # 动画用：起点、终点；年份按角度转，其他按直线走
         self.p0 = self.p1 = QPointF()
         self.polar0 = self.polar1 = None
@@ -91,11 +132,21 @@ class Node(QGraphicsItem):
     def round(self):
         return self.kind in ('center', 'year', 'add')
 
+    def offset(self, t):
+        wx, wy, px, py = self.bob
+        a = self.AMP[self.kind]
+        return QPointF(a * math.sin(wx * t + px) + self.d[0], a * 0.8 * math.sin(wy * t + py) + self.d[1])
+
+    def visual_center(self):
+        return self.pos() if self.round() else self.pos() + QPointF(self.w / 2, 0)
+
     def set_content(self, text, sub, color, data):
         if (text, sub) != (self.text, self.sub) or not self.w:
             self.prepareGeometryChange()
             self.text, self.sub = text, sub
             self._measure()
+            c = self.body().center()
+            self.setTransformOriginPoint(c)
         self.color, self.data = QColor(color), data
         self.update()
 
@@ -121,7 +172,7 @@ class Node(QGraphicsItem):
         return QRectF(0, -self.h / 2, self.w, self.h)
 
     def boundingRect(self):
-        s = self.SPREAD[self.kind] + 2
+        s = glow_margin(self.SIGMA[self.kind])
         return self.body().adjusted(-s, -s, s, s)
 
     def edge_point(self, toward, out):
@@ -137,14 +188,16 @@ class Node(QGraphicsItem):
         p.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing | QPainter.SmoothPixmapTransform)
         r = self.body()
         rad = r.height() / 2
-        lit = self.hover or self.active
-        s = self.SPREAD[self.kind]
-        glow = glow_pixmap(r.width(), r.height(), rad, self.color, s)
-        p.setOpacity(p.opacity() * (1.0 if lit else 0.62))
-        p.drawPixmap(QPointF(r.x() - s - 1, r.y() - s - 1), glow)
-        if self.hover:
-            p.drawPixmap(QPointF(r.x() - s - 1, r.y() - s - 1), glow)
-        p.setOpacity(self.effectiveOpacity())
+        g = max(self.glow, 1.0 if self.active else 0.0, 0.35 + 0.5 * self.breath if self.kind == 'center' else 0.0)
+        lit = g > 0.5
+        pm, m = glow_pixmap(r.width(), r.height(), rad, self.color, self.SIGMA[self.kind])
+        base = p.opacity()
+        p.setOpacity(base * (0.55 + 0.45 * g))
+        p.drawPixmap(QPointF(r.x() - m, r.y() - m), pm)
+        if self.glow > 0.01:                       # 悬停时再叠一层，慢慢亮起来
+            p.setOpacity(base * 0.6 * self.glow)
+            p.drawPixmap(QPointF(r.x() - m, r.y() - m), pm)
+        p.setOpacity(base)
         getattr(self, '_paint_' + self.kind)(p, r, rad, lit)
 
     def _paint_center(self, p, r, rad, lit):
@@ -227,14 +280,17 @@ class Edges(QGraphicsItem):
                 continue
             p1, p2 = a.edge_point(b.pos(), True), b.edge_point(a.pos(), False)
             path = QPainterPath(p1)
-            if a.kind == 'center':
-                path.lineTo(p2)
+            if a.kind == 'center':                 # 中心到年份：往一侧微微弯，像自然长出来的
+                mid = (p1 + p2) / 2
+                d = p2 - p1
+                bend = 0.12 if (b.bob[2] > 3.15) else -0.12
+                path.quadTo(mid + QPointF(-d.y() * bend, d.x() * bend), p2)
             else:
                 dx = (p2.x() - p1.x()) * 0.55
                 path.cubicTo(p1 + QPointF(dx, 0), p2 - QPointF(dx, 0), p2)
-            lit = b.active or b.hover or (a.kind != 'center')
+            lit = b.active or b.glow > 0.5 or (a.kind != 'center')
             g = QLinearGradient(p1, p2)
-            for w, alpha in ((7, 0.10), (3, 0.22), (1.3, 0.9)):
+            for w, alpha in ((5, 0.11), (1.2, 0.85)):          # 一层宽而淡的光 + 一条细亮线（每帧都要重画，层数别多）
                 ca, cb = QColor(a.color), QColor(b.color)
                 k = alpha * op * (1 if lit else 0.45)
                 ca.setAlphaF(min(1, k)); cb.setAlphaF(min(1, k))
@@ -245,7 +301,8 @@ class Edges(QGraphicsItem):
 
 class CoverPopup(QWidget):
     """鼠标停在作品上时弹出的小卡片：封面（没有就画个占位）+ 名字、作者、评分、短评。"""
-    W, PAD, M = 236, 12, 14           # 卡片宽、内边距、外面留给辉光的边
+    W, PAD, SIGMA = 236, 12, 6        # 卡片宽、内边距、辉光模糊半径
+    M = glow_margin(SIGMA)            # 外面留给辉光的边
 
     def __init__(self):
         super().__init__(None, Qt.ToolTip | Qt.FramelessWindowHint)
@@ -295,7 +352,7 @@ class CoverPopup(QWidget):
         p.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing | QPainter.SmoothPixmapTransform)
         m = self.M
         card = QRectF(m, m, self.W, self.ch)
-        p.drawPixmap(QPointF(m - m - 1, m - m - 1), glow_pixmap(card.width(), card.height(), 14, self.color, m))
+        p.drawPixmap(QPointF(0, 0), glow_pixmap(card.width(), card.height(), 14, self.color, self.SIGMA)[0])
         p.setPen(QPen(self.color, 1.2)); p.setBrush(QColor(9, 13, 30, 245))
         p.drawRoundedRect(card, 14, 14)
         p.translate(m, m)
@@ -331,6 +388,10 @@ class MindMap(QGraphicsView):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setScene(QGraphicsScene(-8000, -8000, 16000, 16000, self))
+        if os.environ.get('WORKS_NO_GL') != '1':     # 交给显卡画（一直在漂浮，CPU 画太费）；有问题时设这个环境变量退回 CPU
+            gl = QOpenGLWidget()
+            fmt = QSurfaceFormat(); fmt.setSamples(4); gl.setFormat(fmt)        # 4 倍抗锯齿
+            self.setViewport(gl)
         self.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing | QPainter.SmoothPixmapTransform)
         self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)    # 星空背景跟着视口画，不能只重画局部
         self.setDragMode(QGraphicsView.ScrollHandDrag)
@@ -339,12 +400,15 @@ class MindMap(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setFrameShape(QGraphicsView.NoFrame)
         self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
         self.setStyleSheet('QGraphicsView{background:#050816;border:none}')
+        self.scene().setItemIndexMethod(QGraphicsScene.NoIndex)      # 节点一直在动，不用建索引
 
         self.edges = Edges()
         self.scene().addItem(self.edges)
         self.nodes = {}
         self.doc = None
+        self.root_open = True           # 中心点一下收起全部，再点展开
         self.expanded = None            # 当前展开的年份（一次只展开一年）
         self.collapsed = set()          # 收起来的分类 (年, 分类)
         self.phi = -math.pi / 2         # 年份圈转到的角度：第一年的位置
@@ -353,10 +417,11 @@ class MindMap(QGraphicsView):
         self.hovered = None
         self._press = None
         self._dbl = False
-        self._stars = None
+        self._stars = self._sky = None
 
         self.anim = QVariantAnimation(self, startValue=0.0, endValue=1.0, duration=ANIM_MS)
-        self.anim.setEasingCurve(QEasingCurve.OutCubic)
+        ease = QEasingCurve(QEasingCurve.OutBack); ease.setOvershoot(1.3)      # 展开时稍微冲过头再弹回来
+        self.anim.setEasingCurve(ease)
         self.anim.valueChanged.connect(self._step)
         self.anim.finished.connect(self._finish)
         self.cam = QVariantAnimation(self, startValue=0.0, endValue=1.0, duration=ANIM_MS)
@@ -365,6 +430,11 @@ class MindMap(QGraphicsView):
         self.popup = CoverPopup()
         self.pop_timer = QTimer(self, singleShot=True, interval=220)
         self.pop_timer.timeout.connect(self._show_popup)
+        self.clock = QElapsedTimer(); self.clock.start()
+        self._last_t = 0.0
+        self._mouse = None              # 上一次鼠标在场景里的位置和时间，算划过的速度
+        self.ticker = QTimer(self, timerType=Qt.PreciseTimer, interval=1000 // FPS_CALM)
+        self.ticker.timeout.connect(self._tick)
 
     # ---------- 数据和布局 ----------
     def set_doc(self, doc, expand=None, first=False):
@@ -378,12 +448,20 @@ class MindMap(QGraphicsView):
             self.fit(animate=False)
 
     def expand(self, year):
+        self.root_open = True
         self.expanded = year
         self.relayout()
         self.fit()
 
     def collapse(self):
         self.expanded = None
+        self.relayout()
+        self.fit()
+
+    def toggle_root(self):
+        self.root_open = not self.root_open
+        if not self.root_open:
+            self.expanded = None
         self.relayout()
         self.fit()
 
@@ -399,20 +477,30 @@ class MindMap(QGraphicsView):
         n = max(1, len(years))
         step = 2 * math.pi / n
         self.r1 = r1 = max(250, n * 92 / (2 * math.pi))
+        # 每年离中心的远近、角度带一点固定的随机偏移，看起来是自然散开的
+        jit = {}
+        for i, y in enumerate(years):
+            r = random.Random(f'year{y}')
+            jit[y] = (r.uniform(-0.22, 0.22) * step, r1 * r.uniform(0.8, 1.24))
         if self.expanded in years:              # 展开的那一年转到正右边，转最短的方向
-            want = -years.index(self.expanded) * step
+            want = -(years.index(self.expanded) * step + jit[self.expanded][0])
             self.phi += wrap_angle(want - self.phi)
         counts = {}
         for w in doc['works']:
             counts[w['year']] = counts.get(w['year'], 0) + 1
         t = {'c': ('center', None, '年度作品', f'{len(doc["works"])} 个作品', CENTER_COLOR, None, QPointF(0, 0), None)}
+        if not self.root_open:
+            self.branch_rect = QRectF()
+            return t
         for i, y in enumerate(years):
-            a = self.phi + i * step
+            a = self.phi + i * step + jit[y][0]
+            ry = jit[y][1]
             t[f'y{y}'] = ('year', 'c', str(y), str(counts.get(y, '')), year_color(i, n), y,
-                          QPointF(r1 * math.cos(a), r1 * math.sin(a)), (a, r1))
+                          QPointF(ry * math.cos(a), ry * math.sin(a)), (a, ry))
         self.branch_rect = QRectF()
         y = self.expanded
         if y in years:
+            r1 = jit[y][1]                      # 分支从这一年实际的位置往右长
             ycolor = t[f'y{y}'][4]
             groups = []
             for cat in doc['categories']:
@@ -454,7 +542,8 @@ class MindMap(QGraphicsView):
                     sc.removeItem(node)
                 node = Node(key, kind)
                 par = self.nodes.get(parent)
-                start = par.pos() if par is not None and animate else pos
+                start = QPointF(par.base) if par is not None and animate else pos
+                node.base = QPointF(start)
                 node.setPos(start)
                 node.setOpacity(0 if animate else 1)
                 if polar is not None:
@@ -462,11 +551,11 @@ class MindMap(QGraphicsView):
                 sc.addItem(node)
                 self.nodes[key] = node
             elif polar is not None:
-                node.polar0 = (math.atan2(node.y(), node.x()), math.hypot(node.x(), node.y()))
+                node.polar0 = (math.atan2(node.base.y(), node.base.x()), math.hypot(node.base.x(), node.base.y()))
             node.parent_key = parent
             node.set_content(text, sub, color, data)
             node.active = (kind == 'year' and data == self.expanded)
-            node.p0, node.p1 = node.pos(), pos
+            node.p0, node.p1 = QPointF(node.base), pos
             node.o0, node.o1 = node.opacity(), 1.0
             node.polar1 = polar
             if polar is not None and node.polar0 is not None:     # 转最短的方向
@@ -475,7 +564,7 @@ class MindMap(QGraphicsView):
             if key not in targets and not node.removing:
                 node.removing = True
                 par = targets.get(node.parent_key)
-                node.p0, node.p1 = node.pos(), (par[6] if par else node.pos())
+                node.p0, node.p1 = QPointF(node.base), (par[6] if par else QPointF(0, 0))
                 node.o0, node.o1 = node.opacity(), 0.0
                 node.polar1 = None
                 node.hover = False
@@ -492,31 +581,112 @@ class MindMap(QGraphicsView):
 
     def _step(self, t):
         t = float(t)
+        tc = min(1.0, t)                        # 回弹曲线会超过 1：位置可以冲过头，透明度不行
         for n in self.nodes.values():
+            k = tc if n.removing else t
             if n.polar1 is not None and n.polar0 is not None:
-                a, r = lerp(n.polar0[0], n.polar1[0], t), lerp(n.polar0[1], n.polar1[1], t)
-                n.setPos(r * math.cos(a), r * math.sin(a))
+                a, r = lerp(n.polar0[0], n.polar1[0], k), lerp(n.polar0[1], n.polar1[1], k)
+                n.base = QPointF(r * math.cos(a), r * math.sin(a))
             else:
-                n.setPos(lerp(n.p0.x(), n.p1.x(), t), lerp(n.p0.y(), n.p1.y(), t))
-            n.setOpacity(lerp(n.o0, n.o1, t))
+                n.base = QPointF(lerp(n.p0.x(), n.p1.x(), k), lerp(n.p0.y(), n.p1.y(), k))
+            n.setOpacity(max(0.0, min(1.0, lerp(n.o0, n.o1, tc))))
+        self._apply()
+
+    def _apply(self):
+        t = self.clock.elapsed() / 1000
+        for n in self.nodes.values():
+            n.setPos(n.base + n.offset(t))
         self.edges.update()
+
+    def _tick(self):
+        if self.window().isMinimized():
+            return
+        now = self.clock.elapsed() / 1000
+        dt = min(0.05, now - self._last_t); self._last_t = now
+        busy = self.anim.state() == QVariantAnimation.Running or self.cam.state() == QVariantAnimation.Running
+        for n in self.nodes.values():
+            busy = busy or n.v[0] or n.v[1] or (n.glow != (1.0 if n.hover else 0.0))
+            # 鼠标扰动：弹簧把节点拉回原位，带一点阻尼，会轻轻晃一下
+            for i in (0, 1):
+                if n.d[i] or n.v[i]:
+                    n.v[i] += (-SPRING * n.d[i] - DAMP * n.v[i]) * dt
+                    n.d[i] = max(-MAX_PUSH, min(MAX_PUSH, n.d[i] + n.v[i] * dt))
+                    if abs(n.d[i]) < 0.03 and abs(n.v[i]) < 0.03:
+                        n.d[i] = n.v[i] = 0.0
+            # 悬停亮度慢慢过渡，节点跟着稍微放大
+            want = 1.0 if n.hover else 0.0
+            if abs(n.glow - want) > 0.005:
+                n.glow += (want - n.glow) * min(1.0, dt * 9)
+                if abs(n.glow - want) <= 0.005:
+                    n.glow = want
+                n.setScale(1 + 0.07 * n.glow)
+                n.update()
+        self.ticker.setInterval(1000 // (FPS_BUSY if busy else FPS_CALM))
+        c = self.nodes.get('c')
+        if c is not None:                       # 中心慢慢呼吸
+            c.breath = 0.5 + 0.5 * math.sin(now * 1.3)
+            c.update()
+        self._apply()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self.ticker.start()
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self.ticker.stop()
+
+    def push(self, scene_pos):
+        # 鼠标划过：附近的节点被推开一点，顺着鼠标的方向带一下
+        now = self.clock.elapsed() / 1000
+        mv = QPointF()
+        dt = 0.0
+        if self._mouse is not None:
+            dt = min(0.05, max(0.004, now - self._mouse[1]))
+            mv = (scene_pos - self._mouse[0]) / dt
+            sp = math.hypot(mv.x(), mv.y())
+            if sp > 1400:
+                mv *= 1400 / sp
+        self._mouse = (scene_pos, now)
+        for n in self.nodes.values():
+            if n.removing:
+                continue
+            c = n.visual_center()
+            dx, dy = c.x() - scene_pos.x(), c.y() - scene_pos.y()
+            ex = max(0.0, abs(dx) - (0 if n.round() else (n.w - n.h) / 2))   # 胶囊按离边的距离算
+            dist = max(0.0, math.hypot(ex, dy) - n.h / 2)
+            if dist >= PUSH_R:
+                continue
+            f = (1 - dist / PUSH_R) ** 2
+            norm = math.hypot(dx, dy) or 1
+            n.v[0] += (dx / norm * PUSH_AWAY + mv.x() * PUSH_DRAG) * f * dt
+            n.v[1] += (dy / norm * PUSH_AWAY + mv.y() * PUSH_DRAG) * f * dt
 
     def _finish(self):
         for key in [k for k, n in self.nodes.items() if n.removing]:
             self.scene().removeItem(self.nodes.pop(key))
         for n in self.nodes.values():
             n.polar0 = n.polar1
+            if n.polar1 is not None:
+                a, r = n.polar1
+                n.base = QPointF(r * math.cos(a), r * math.sin(a))
+            elif not n.removing:
+                n.base = QPointF(n.p1)
+        self._apply()
         self._links()
 
     # ---------- 镜头 ----------
     def fit(self, animate=True):
         """展开时对准那一支，没展开时看整圈。"""
         vw, vh = self.viewport().width(), self.viewport().height()
-        if self.branch_rect.isValid():
+        if not self.root_open:
+            rect = QRectF(-200, -200, 400, 400)
+            s = 1.0
+        elif self.branch_rect.isValid():
             rect = self.branch_rect
             s = max(0.7, min(1.15, (vw - 80) / rect.width(), (vh - 110) / rect.height()))
         else:
-            R = self.r1 + 90
+            R = self.r1 * 1.24 + 90
             rect = QRectF(-R, -R, 2 * R, 2 * R)
             s = max(0.4, min(1.25, (vw - 80) / rect.width(), (vh - 110) / rect.height()))
         self._cam0 = (self.transform().m11(), self.mapToScene(self.viewport().rect().center()))
@@ -545,7 +715,7 @@ class MindMap(QGraphicsView):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        self._stars = None
+        self._stars = self._sky = None
 
     # ---------- 背景 ----------
     def _star_pixmap(self):
@@ -564,17 +734,28 @@ class MindMap(QGraphicsView):
             self._stars = pm
         return self._stars
 
+    def _sky_pixmap(self):
+        """深蓝渐变底 + 两团淡淡的星云。不随画布动，按窗口大小画一次缓存起来（每帧算渐变很费 CPU）。"""
+        size = self.viewport().size()
+        if self._sky is None or self._sky.size() != size:
+            pm = QPixmap(size)
+            p = QPainter(pm)
+            vp = QRectF(0, 0, size.width(), size.height())
+            g = QRadialGradient(vp.center(), max(vp.width(), vp.height()) * 0.75)
+            g.setColorAt(0, QColor('#0e1638')); g.setColorAt(0.55, QColor('#070b1f')); g.setColorAt(1, QColor('#020309'))
+            p.fillRect(vp, g)
+            for (fx, fy), col, rr in (((0.18, 0.2), QColor(120, 60, 255, 38), 0.45), ((0.85, 0.85), QColor(0, 200, 255, 30), 0.5)):
+                ng = QRadialGradient(QPointF(vp.width() * fx, vp.height() * fy), max(vp.width(), vp.height()) * rr)
+                ng.setColorAt(0, col); ng.setColorAt(1, QColor(0, 0, 0, 0))
+                p.fillRect(vp, ng)
+            p.end()
+            self._sky = pm
+        return self._sky
+
     def drawBackground(self, p, rect):
         vp = self.viewport().rect()
         p.save(); p.resetTransform()
-        c = QPointF(vp.center())
-        g = QRadialGradient(c, max(vp.width(), vp.height()) * 0.75)
-        g.setColorAt(0, QColor('#0e1638')); g.setColorAt(0.55, QColor('#070b1f')); g.setColorAt(1, QColor('#020309'))
-        p.fillRect(vp, g)
-        for (fx, fy), col, rr in (((0.18, 0.2), QColor(120, 60, 255, 38), 0.45), ((0.85, 0.85), QColor(0, 200, 255, 30), 0.5)):
-            ng = QRadialGradient(QPointF(vp.width() * fx, vp.height() * fy), max(vp.width(), vp.height()) * rr)
-            ng.setColorAt(0, col); ng.setColorAt(1, QColor(0, 0, 0, 0))
-            p.fillRect(vp, ng)
+        p.drawPixmap(0, 0, self._sky_pixmap())
         # 星星跟着画布慢慢挪一点（视差），有纵深感
         stars = self._star_pixmap()
         off = self.mapToScene(vp.center()) * 0.04
@@ -584,8 +765,8 @@ class MindMap(QGraphicsView):
                 p.drawPixmap(QPointF(dx, dy), stars)
         p.restore()
         # 年份那一圈轨道和里外两圈细线
-        for r, alpha, dash in ((self.r1, 55, True), (self.r1 * 0.62, 30, False), (self.r1 + 64, 22, False)):
-            pen = QPen(QColor(120, 190, 255, alpha), 1, Qt.DashLine if dash else Qt.SolidLine)
+        for r, alpha, dash in ((self.r1 * 0.55, 26, False), (self.r1, 18, True), (self.r1 * 1.45, 14, False)):
+            pen = QPen(QColor(120, 190, 255, alpha), 1, Qt.DotLine if dash else Qt.SolidLine)
             pen.setCosmetic(True)
             p.setPen(pen); p.setBrush(Qt.NoBrush)
             p.drawEllipse(QPointF(0, 0), r, r)
@@ -601,11 +782,11 @@ class MindMap(QGraphicsView):
         if n is self.hovered:
             return
         if self.hovered is not None:
-            self.hovered.hover = False; self.hovered.update()
+            self.hovered.hover = False
         self.hovered = n
         self.popup.hide(); self.pop_timer.stop()
         if n is not None:
-            n.hover = True; n.update()
+            n.hover = True
             if n.kind == 'work':
                 self.pop_timer.start()
         self.viewport().setCursor(Qt.PointingHandCursor if n is not None else Qt.OpenHandCursor)
@@ -628,6 +809,9 @@ class MindMap(QGraphicsView):
             self._press = (self._press[0], True)          # 在拖动画布
         if not (self._press and self._press[1]):
             self._set_hover(self.node_at(e.position().toPoint()))
+            self.push(self.mapToScene(e.position().toPoint()))
+        else:
+            self._mouse = None
 
     def mouseReleaseEvent(self, e):
         super().mouseReleaseEvent(e)
@@ -653,7 +837,7 @@ class MindMap(QGraphicsView):
             return
         k = n.kind
         if k == 'center':
-            self.collapse()
+            self.toggle_root()
         elif k == 'year':
             self.collapse() if n.data == self.expanded else self.expand(n.data)
         elif k == 'cat':
@@ -672,6 +856,7 @@ class MindMap(QGraphicsView):
         def add(icon, text, fn):
             a = Action(icon, text, self); a.triggered.connect(fn); menu.addAction(a)
         if n is None or n.kind == 'center':
+            add(FIF.UP if self.root_open else FIF.DOWN, '收起全部' if self.root_open else '展开全部', self.toggle_root)
             add(FIF.ADD, '添加年份', self.addYear.emit)
             add(FIF.FULL_SCREEN, '回到全图', self.collapse)
         elif n.kind == 'year':
