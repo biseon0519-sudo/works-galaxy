@@ -1060,7 +1060,7 @@ class MindMap(QOpenGLWidget):
                 ux, uy = dx * cr + dy * sr, -dx * sr + dy * cr
                 r0, th0 = math.hypot(ux, uy), math.atan2(uy, ux)
                 r = r0 + (rd - r0) * t ** 0.85
-                th = th0 - 1.05 * t ** 1.25
+                th = th0 - 0.28 * t ** 2.5               # 基本直着流向黑洞，只在快到盘时顺一下盘的转向；弯曲主要靠惯性（往哪拖就往反方向甩）
                 sq = 1 + (flat - 1) * t ** 2.2
                 px_, py_ = r * np.cos(th), r * np.sin(th) * sq
                 ideal = np.stack([bx + px_ * cr - py_ * sr, by + px_ * sr + py_ * cr], 1)
