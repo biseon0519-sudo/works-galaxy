@@ -469,6 +469,9 @@ void main(){ f = vec4(texture(u_tex, v_uv).rgb, 1.0); }
 
 BEAM_HW = 20.0            # 光线条带的半宽（屏幕像素），要盖住柔光的范围
 BEAM_SEG = 18             # 每条线切成几段
+# 物质流的惯性：每个点跟不上的比例（两头 0、中间最大），弹簧劲度、阻尼（软一点，带一点轻微的摆）
+STREAM_LAG = (np.sin(np.linspace(0, 1, BEAM_SEG + 1) * np.pi) ** 0.8 * 0.85)
+STREAM_K, STREAM_D = 9.0, 4.5
 
 
 class Node:
@@ -664,6 +667,7 @@ class MindMap(QOpenGLWidget):
         self.cine = 0.0                 # 0 = 全图（黑洞在中间、斜看），1 = 展开（黑洞在左边、侧视放大）
         self.bh = (-9999.0, -9999.0, 1.0, EL_MAP, 0.0)   # 这一帧黑洞在屏幕上的 x、y、阴影半径、仰角、滚转
         self._ropes = {}                # 分支光丝的惯性状态
+        self._streams = {}              # 物质流的惯性状态（每条流一串点的偏移和速度）
         # 晶尘粒子，每行：世界 x、y，速度 x、y，剩余寿命，总寿命，大小，颜色 r、g、b，闪烁相位
         self.dust = np.zeros((0, 11), 'f4')
         self._rope_t = 0.0
@@ -1059,7 +1063,18 @@ class MindMap(QOpenGLWidget):
                 th = th0 - 1.05 * t ** 1.25
                 sq = 1 + (flat - 1) * t ** 2.2
                 px_, py_ = r * np.cos(th), r * np.sin(th) * sq
-                paths.append(np.stack([bx + px_ * cr - py_ * sr, by + px_ * sr + py_ * cr], 1))
+                ideal = np.stack([bx + px_ * cr - py_ * sr, by + px_ * sr + py_ * cr], 1)
+                # 物质流有惯性：恒星自己动了（拖动、漂浮），中间那段跟不上、被拖成一道弯，再像弹簧一样慢慢顺回来。
+                # 按世界坐标算移动量，所以拖动整个画面时不会拖尾；两头（恒星、吸积盘）固定不动
+                world = (ideal - (self.width() / 2, self.height() / 2)) / self.cam_s + (self.cam_c.x(), self.cam_c.y())
+                st = self._streams.get(n.key)
+                if st is None:
+                    st = self._streams[n.key] = {'last': world, 'o': np.zeros_like(world), 'v': np.zeros_like(world)}
+                st['o'] -= (world - st['last']) * STREAM_LAG[:, None]
+                st['last'] = world
+                st['v'] += (-STREAM_K * st['o'] - STREAM_D * st['v']) * dt
+                st['o'] = np.clip(st['o'] + st['v'] * dt, -120, 120)
+                paths.append(ideal + st['o'] * self.cam_s)
                 strength = 1.0 if (n.active or n.glow > 0.3) else 0.62
                 cols.append((_rgba(n.color), _rgba(DISK_COLOR), op * strength)); kinds.append(0.0)
                 continue
@@ -1087,6 +1102,8 @@ class MindMap(QOpenGLWidget):
             cols.append((_rgba(a.color), _rgba(n.color), op * 0.9)); kinds.append(1.0)
         for key in [key for key in self._ropes if key not in alive]:
             del self._ropes[key]
+        for key in [key for key in self._streams if key not in alive]:
+            del self._streams[key]
         if not paths:
             return 0
         E, S = len(paths), BEAM_SEG
