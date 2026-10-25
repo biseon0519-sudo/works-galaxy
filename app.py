@@ -46,6 +46,7 @@ class App(Window):
         self.map.addWork.connect(self.add_work)
         self.map.addYear.connect(self.add_year)
         self.map.deleteYear.connect(self.delete_year)
+        self.map.layoutChanged.connect(lambda: store.save(self.doc))     # 拖过恒星：位置存进 data/作品.json
 
         # 浮在导图上的按钮和提示
         self.tools = QWidget(self)

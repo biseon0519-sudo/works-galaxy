@@ -62,6 +62,16 @@ def font(px, bold=False, family=FONT):
     return f
 
 
+def spiral_points(n, r0=175.0, gap=135.0, grow=46.0):
+    """阿基米德螺旋 r = r0 + grow·θ 上按相同弧长 gap 取 n 个点，返回 [(角度, 半径)]。角度往负方向转（和吸积盘转向一致）。"""
+    pts, th = [], 0.0
+    for _ in range(n):
+        r = r0 + grow * th
+        pts.append((-th, r))
+        th += gap / math.hypot(r, grow)
+    return pts
+
+
 def lerp(a, b, t):
     return a + (b - a) * t
 
@@ -157,13 +167,32 @@ void main(){
     vec2 src = px - d / r * (E * E / max(r, u_bh.z * 0.6));
     float lens = smoothstep(u_bh.z * 0.95, u_bh.z * 1.2, r);
     vec2 sp = mix(px, src, lens);
-    // 星云
+    // 银河：从左上斜贯到右下的一条光带。视差很小，像在很远的地方
+    vec2 gp = sp + u_pan * 0.03;
+    vec2 dir = normalize(u_vp), nrm = vec2(-dir.y, dir.x);
+    vec2 rel = gp - c;
+    float along = dot(rel, dir), across = dot(rel, nrm);
+    float wob = (fbm(vec2(along / 600.0, 3.0)) - 0.5) * dmax * 0.12;       // 光带边缘不是直的
+    float band = exp(-pow((across + wob) / (dmax * 0.16), 2.0));
+    float bulge = exp(-pow((along + dmax * 0.12) / (dmax * 0.35), 2.0));      // 偏左上一团更亮的核心
+    float clouds = fbm(gp / 140.0) * 0.6 + fbm(gp / 45.0 + 7.0) * 0.4;        // 星云团
+    float lanes = smoothstep(0.48, 0.72, fbm(vec2(along / 260.0, (across + wob) / 70.0) + 11.0));   // 顺着光带拉长的暗色尘埃带
+    float lane2 = smoothstep(0.55, 0.8, fbm(gp / 60.0 + 23.0));
+    vec3 mw = mix(vec3(0.62, 0.72, 1.0), vec3(1.0, 0.82, 0.62), bulge * 0.8 + clouds * 0.2);
+    float glow = band * (0.10 + 0.22 * bulge) * (0.45 + 0.9 * clouds);
+    glow *= 1.0 - (lanes * 0.8 + lane2 * 0.35) * band;
+    col += mw * glow;
+    col += vec3(0.95, 0.32, 0.45) * smoothstep(0.68, 0.85, fbm(gp / 80.0 + 41.0)) * band * 0.12;   // 零星的粉红色发射星云
+    // 淡淡的蓝紫色星云（弱一点，别抢银河）
     vec2 np = (sp + u_pan * 0.05) / 520.0;
     float n = fbm(np + vec2(u_time * 0.006, -u_time * 0.004));
     float m = fbm(np * 1.7 + vec2(4.0, 1.0) - u_time * 0.003);
     vec3 neb = mix(vec3(0.42, 0.20, 0.85), vec3(0.0, 0.55, 0.85), smoothstep(0.3, 0.7, m));
-    col += neb * smoothstep(0.38, 0.9, n) * 0.42;
-    // 星星：远的一层动得最少
+    col += neb * smoothstep(0.42, 0.9, n) * 0.16;
+    // 星星：满天都有，银河里密得多；最细的两层是满天的微光，远的一层动得最少
+    float dens = band * (1.0 - lanes * 0.7);
+    col += stars(sp + u_pan * 0.01, 3.2, 0.06 + 0.5 * dens, 0.32) * (0.5 + 0.8 * dens);
+    col += stars(sp + u_pan * 0.015, 5.5, 0.05 + 0.3 * dens, 0.42) * 0.9;
     col += stars(sp + u_pan * 0.02, 9.0, 0.10, 0.55);
     col += stars(sp + u_pan * 0.05, 23.0, 0.16, 0.8) * 1.2;
     col += stars(sp + u_pan * 0.10, 61.0, 0.22, 1.15) * 1.5;
@@ -609,6 +638,7 @@ class MindMap(QOpenGLWidget):
     addWork = Signal(int, str)        # 年份, 分类（空字符串表示不指定）
     addYear = Signal()
     deleteYear = Signal(int)
+    layoutChanged = Signal()          # 用户拖动了恒星，要存盘
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -629,6 +659,7 @@ class MindMap(QOpenGLWidget):
         self.cam_c, self.cam_s = QPointF(0, 0), 1.0       # 镜头：看向的世界坐标、缩放
         self._press = None              # (按下的位置, 是否在拖动, 按下时的镜头中心)
         self._dbl = False
+        self._drag_star = None          # 正在拖的恒星
         self._mouse = None              # 上一次鼠标位置和时间，算划过的速度
         self.cine = 0.0                 # 0 = 全图（黑洞在中间、斜看），1 = 展开（黑洞在左边、侧视放大）
         self.bh = (-9999.0, -9999.0, 1.0, EL_MAP, 0.0)   # 这一帧黑洞在屏幕上的 x、y、阴影半径、仰角、滚转
@@ -696,15 +727,21 @@ class MindMap(QOpenGLWidget):
         doc = self.doc
         years = sorted(doc['years'])
         n = max(1, len(years))
-        step = 2 * math.pi / n
-        self.r1 = r1 = max(280, n * 100 / (2 * math.pi))
-        # 每年离中心的远近、角度、前后都带一点固定的随机偏移，看起来是自然散开的
+        # 旋臂：按时间顺序沿一条从黑洞旋出去的螺旋排，最早的离黑洞最近；每颗带一点固定的随机偏移和远近
+        spiral = spiral_points(n)
+        custom = doc.get('star_pos', {})        # 用户拖过的恒星：相对自动位置的偏移（没转动前的坐标）
         jit = {}
         for i, y in enumerate(years):
             r = random.Random(f'year{y}')
-            jit[y] = (r.uniform(-0.22, 0.22) * step, r1 * r.uniform(0.8, 1.24), r.uniform(-140, 140))
+            a, rr = spiral[i]
+            a += r.uniform(-0.1, 0.1); rr *= r.uniform(0.92, 1.08)
+            x, yy = rr * math.cos(a), rr * math.sin(a)
+            if str(y) in custom:
+                x += custom[str(y)][0]; yy += custom[str(y)][1]
+            jit[y] = (math.atan2(yy, x), math.hypot(x, yy), r.uniform(-140, 140))
+        self.r1 = max([j[1] for j in jit.values()] + [280]) / 1.24      # 全图的范围
         if self.expanded in years:              # 展开的那一年转到正右边，转最短的方向
-            want = -(years.index(self.expanded) * step + jit[self.expanded][0])
+            want = -jit[self.expanded][0]
             self.phi += wrap_angle(want - self.phi)
         counts = {}
         for w in doc['works']:
@@ -714,7 +751,7 @@ class MindMap(QOpenGLWidget):
         if not self.root_open:
             return t
         for i, y in enumerate(years):
-            a = self.phi + i * step + jit[y][0]
+            a = self.phi + jit[y][0]
             ry = jit[y][1]
             z = 0.0 if y == self.expanded else jit[y][2]       # 展开的那一年移到和分支同一层
             t[f'y{y}'] = ('year', 'c', str(y), str(counts.get(y, '')), star_color(i, n), y,
@@ -732,7 +769,7 @@ class MindMap(QOpenGLWidget):
             blocks = [(1 if col else len(ws)) * LEAF for _, ws, col in groups]
             total = sum(blocks) + GROUP_GAP * len(groups) + LEAF
             cur = -total / 2
-            x2 = r1 + 140
+            x2 = r1 + 240                       # 恒星和分类之间多留点距离
             cat_w = max([QFontMetricsF(font(14, True)).horizontalAdvance(c) for c, _, _ in groups] + [0]) + 70
             x3 = x2 + cat_w + 60
             right = x2 + 40
@@ -917,7 +954,7 @@ class MindMap(QOpenGLWidget):
             s = max(0.4, min(1.25, (vw - 80) / rect.width(), (vh - 110) / rect.height()))
         center = rect.center() + QPointF(0, -14 / s)    # 稍微往上一点，给底下的提示文字留位置
         if self.root_open and self.branch_rect.isValid():
-            left = vw * 0.44                    # 展开时左边留给黑洞，分支放在右边
+            left = vw * 0.34                    # 展开时左边留给黑洞，恒星和分支放在右边
             aw = vw - left - 30
             s = max(0.6, min(1.15, aw / rect.width(), (vh - 110) / rect.height()))
             center = QPointF(rect.center().x() - (left + aw / 2 - vw / 2) / s, rect.center().y() - 14 / s)
@@ -1340,6 +1377,9 @@ class MindMap(QOpenGLWidget):
         self.popup.hide(); self.pop_timer.stop()
         if e.button() == Qt.LeftButton:
             self._press = (e.position(), False, QPointF(self.cam_c))
+            n = self.node_at(e.position())
+            # 全图里按住恒星：拖的是这颗恒星，不是整个画面
+            self._drag_star = n if (n is not None and n.kind == 'year' and not self.fixed_view()) else None
 
     def mouseMoveEvent(self, e):
         pos = e.position()
@@ -1349,6 +1389,15 @@ class MindMap(QOpenGLWidget):
                 self._press = (self._press[0], True, self._press[2])     # 在拖动画布
                 self.setCursor(Qt.ClosedHandCursor)
                 self._set_hover(None)
+            if self._press[1] and self._drag_star is not None:
+                n = self._drag_star
+                w = self.unproject(pos.x(), pos.y())
+                o = n.offset(self.clock.elapsed() / 1000)
+                n.base = QPointF(w.x() - o.x(), w.y() - o.y())   # 跟着鼠标走（扣掉漂浮）
+                n.polar1 = n.polar0 = (math.atan2(n.base.y(), n.base.x()), math.hypot(n.base.x(), n.base.y()))
+                self._mouse = None
+                self.update()
+                return
             if self._press[1]:
                 self.cam_c = self._press[2] - d / self.cam_s
                 self._mouse = None
@@ -1359,6 +1408,11 @@ class MindMap(QOpenGLWidget):
 
     def mouseReleaseEvent(self, e):
         press, self._press = self._press, None
+        star, self._drag_star = self._drag_star, None
+        if star is not None and press and press[1]:
+            self._save_star(star)
+            self._set_hover(self.node_at(e.position()))
+            return
         if self._dbl:
             self._dbl = False
             return
@@ -1375,6 +1429,23 @@ class MindMap(QOpenGLWidget):
         self._set_hover(None)
         self._mouse = None
         super().leaveEvent(e)
+
+    def _save_star(self, n):
+        """把拖过的恒星位置存成相对自动位置的偏移（换算到没转动前的坐标，展开时整体转动也不会乱）。"""
+        years = sorted(self.doc['years'])
+        i = years.index(n.data)
+        r = random.Random(f'year{n.data}')
+        a, rr = spiral_points(len(years))[i]
+        a += r.uniform(-0.1, 0.1); rr *= r.uniform(0.92, 1.08)
+        c, s_ = math.cos(-self.phi), math.sin(-self.phi)
+        bx, by = n.base.x() * c - n.base.y() * s_, n.base.x() * s_ + n.base.y() * c
+        self.doc.setdefault('star_pos', {})[str(n.data)] = [round(bx - rr * math.cos(a), 1), round(by - rr * math.sin(a), 1)]
+        self.layoutChanged.emit()
+
+    def reset_star(self, year):
+        self.doc.get('star_pos', {}).pop(str(year), None)
+        self.layoutChanged.emit()
+        self.relayout()
 
     def click(self, n):
         if n is None:
@@ -1405,6 +1476,8 @@ class MindMap(QOpenGLWidget):
             add(FIF.FULL_SCREEN, '回到全图', self.collapse)
         elif n.kind == 'year':
             add(FIF.ADD, f'在 {n.data} 年添加作品', lambda: self.addWork.emit(n.data, ''))
+            if str(n.data) in self.doc.get('star_pos', {}):
+                add(FIF.SYNC, '恢复自动位置', lambda: self.reset_star(n.data))
             add(FIF.DELETE, f'删除 {n.data} 年', lambda: self.deleteYear.emit(n.data))
         elif n.kind == 'cat':
             y, cat = n.data
