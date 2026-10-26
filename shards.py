@@ -1,24 +1,26 @@
-# 恒星碎裂的碎片。点下去的那一刻，用显卡把所有碎片的运动整段模拟出来（transform feedback，一遍算 8 步），
+# 恒星被黑洞撕碎（潮汐瓦解）。点下去的那一刻，用显卡把所有气体的运动整段模拟出来（transform feedback，一遍算 8 步），
 # 路线存成一张显存里的纹理；之后每帧显卡按时间从纹理里取位置来画——收起正着放，展开倒着放（展开 = 收起倒放），
-# CPU 不用逐帧算碎片。每颗恒星怎么碎（几块、多大、往哪迸）在 CPU 上算一次。
+# CPU 不用逐帧算。每颗恒星化成多少团气体、各自的初速度在 CPU 上算一次。
 import math
 import numpy as np
 import moderngl
 from shaders import SHARD_SIM_VS, SHARD_VS, SHARD_FS
 
 SIM_HZ = 120              # 模拟、记录路线的步长（每秒多少步）
-SIM_STEPS = 5 * SIM_HZ    # 最多模拟 5 秒（没掉进去的碎片 4.4 秒后淡掉）
+SIM_STEPS = 5 * SIM_HZ    # 最多模拟 5 秒（没掉进去的气体 4.4 秒后淡掉）
 PER_PASS = 8              # 显卡每一遍算几步（和 SHARD_SIM_VS 一致）
-STRIDE = 10 * 16          # 每片碎片每一遍输出的字节数：状态 2 个 vec4 + 8 个位置
+STRIDE = 10 * 16          # 每团气体每一遍输出的字节数：状态 2 个 vec4 + 8 个位置
 TEX_W = 8192              # 路线纹理的宽度（一遍的数据按顺序铺进去，取的时候按编号算位置）
-# 碎片的引力按真实的平方反比：加速度 = SHARD_G / r²，朝着黑洞（离得近的很快掉进去，远的晚一些，越靠近越快）
+# 引力按真实的平方反比：加速度 = SHARD_G / r²，朝着黑洞。恒星大小范围内近的一侧比远的一侧受的引力大，
+# 自己就会被拉成一长条（“意大利面化”）；再加上恒星本来绕着黑洞走的速度，这一长条会绕着黑洞旋进去
 SHARD_G = 8e7
-SHARD_KT, SHARD_KR = 0.7, 0.0         # 引力接管后横向、径向的阻力
-SHARD_CARRY = 120.0       # 恒星碎开时本身正被吸过去的速度，碎片继承一部分
-TIDAL = 80.0              # 离黑洞近时，潮汐把碎片顺着指向黑洞的方向拉开（近的一侧往里、远的一侧往外）
-# 三种碎片：火星（很多、很小、迸得快停得快）、碎片、大块（少、慢、阻力小，看起来沉）
-SPARK, SHARD, CHUNK = 0, 1, 2
-WEIGHT = np.array([0.3, 2.0, 8.0], 'f4')      # 算“吞了多少”、黑洞被照亮多少时，大块分量重
+SHARD_KT, SHARD_KR = 0.7, 0.0         # 横向、径向的阻力（靠近黑洞时横向阻力再加大，被盘接住）
+SHARD_CARRY = 120.0       # 恒星被撕开时本身正被吸过去的速度
+ORBIT = 0.55              # 恒星绕黑洞走的速度（圆轨道速度的几成），顺着吸积盘转的方向
+TIDAL = 90.0              # 潮汐：撕开那一刻，近的一侧已经比远的一侧走得快（拉长）、两侧往中间挤
+GAS, SPARK = 1, 0
+PER_STAR = (700, 120)     # 每颗恒星化成多少团气体、多少个亮点
+WEIGHT = np.array([0.3, 1.0], 'f4')           # 算“吞了多少”、黑洞被照亮多少时，亮点分量轻
 
 
 def tidal(r):
@@ -27,54 +29,41 @@ def tidal(r):
     return t * t * (3 - 2 * t)
 
 
-def fragments(rng, color, x0, y0, z0, R):
-    """一颗半径 R 的恒星在世界坐标 (x0, y0, z0) 碎开时的碎片。离黑洞越近崩得越猛、碎得越细，顺着指向黑洞的方向被拉开。
+def debris(rng, color, x0, y0, z0, R, long_=1.0, thin=1.0, tear_s=0.0):
+    """一颗半径 R 的恒星在世界坐标 (x0, y0, z0) 被撕开时化成的气体。离黑洞越近，拉得越长。
+    long_、thin：撕开那一刻星体已经顺着黑洞方向被拉长、两侧被挤扁的比例，气体就铺在同样的椭圆里，接得上。
+    tear_s：星体从朝黑洞的一侧到背面被撕完要多久，每团气体等撕到它那里才出现。
     返回 (模拟的初始状态 (N, 8)，画用的参数 (N, 16))；画用参数里的编号、开始时间、步数之后再填。"""
     r0 = math.hypot(x0, y0) or 1.0
     ur = np.array([x0 / r0, y0 / r0])           # 从黑洞指向恒星
+    ut = np.array([y0 / r0, -x0 / r0])          # 绕黑洞走的方向（和吸积盘在屏幕上的转向一致）
     td = tidal(r0)
-    kc, km, ks = round(5 + 4 * td), round(18 + 16 * td), round(130 + 130 * td)
-    # 大块：在恒星圆面上均匀铺开（向日葵排布 + 抖动），合起来盖住大半个圆面，碎开那一刻看起来就是恒星裂成了几块
-    i = np.arange(kc) + 0.5
-    rad, th = np.sqrt(i / kc) * 0.62 * R, i * 2.39996 + rng.uniform(0, 6.28)
-    off_c = np.stack([rad * np.cos(th), rad * np.sin(th)], 1) + rng.normal(0, 0.06 * R, (kc, 2))
-    size_c = R * math.sqrt(0.55 / kc) * rng.uniform(0.8, 1.15, kc)
-    rad, th = np.sqrt(rng.random(km)) * 0.95 * R, rng.uniform(0, 6.28, km)
-    off_m = np.stack([rad * np.cos(th), rad * np.sin(th)], 1)
-    size_m = R * rng.uniform(0.07, 0.14, km)
-    off_s = rng.normal(0, 0.4 * R, (ks, 2))
-    size_s = rng.uniform(0.5, 1.5, ks)
-    off = np.concatenate([off_c, off_m, off_s])
-    size = np.concatenate([size_c, size_m, size_s])
-    kind = np.repeat([CHUNK, SHARD, SPARK], [kc, km, ks])
-    N = len(off)
-    # 往外迸：大块慢、火星快；离黑洞越近越猛。方向带点随机，不是整齐地往外
-    lo = np.array([70, 40, 18])[kind] * 1.0; hi = np.array([190, 100, 45])[kind] * 1.0
-    sp = rng.uniform(lo, hi) * np.where(kind == SPARK, 0.7 + 0.8 * td, 0.6 + 0.9 * td)
-    norm = np.hypot(off[:, 0], off[:, 1]) + 1e-3
-    a = rng.normal(0, 0.5, N)
-    ux, uy = off[:, 0] / norm, off[:, 1] / norm
-    vx = (ux * np.cos(a) - uy * np.sin(a)) * sp
-    vy = (ux * np.sin(a) + uy * np.cos(a)) * sp
-    carry = SHARD_CARRY * rng.uniform(0.7, 1.3, N)
-    stretch = (off @ ur) / R * TIDAL * td                      # 潮汐：靠黑洞的一侧被往里拉、外侧落在后面
-    vx += ur[0] * (stretch - carry) + rng.normal(0, 10, N)
-    vy += ur[1] * (stretch - carry) + rng.normal(0, 10, N)
-    drag = np.array([1.4, 0.8, 0.35])[kind]
+    ng, ns = PER_STAR
+    N = ng + ns
+    kind = np.repeat([GAS, SPARK], [ng, ns])
+    rad, th = np.sqrt(rng.random(N)), rng.uniform(0, 6.2832, N)               # 铺满整个（被拉长的）恒星
+    along, side = rad * np.cos(th), rad * np.sin(th)                          # 沿着 / 垂直于“黑洞—恒星”方向的位置（-1~1）
+    off = (along * R * long_)[:, None] * ur + (side * R * thin)[:, None] * ut
+    vc = math.sqrt(SHARD_G / r0)
+    # 整颗恒星一起：被吸过去 + 绕着黑洞走；各部分之间：近的一侧往里冲、远的一侧落在后面（拉长），
+    # 近的一侧绕得也快一点（剪切，拉出来的一条是弯的），两侧往中间挤
+    v_r = -SHARD_CARRY * rng.uniform(0.9, 1.1) + along * TIDAL * (0.5 + td)
+    v_t = vc * ORBIT * (1 - 0.3 * along) - side * 30.0
+    v = v_r[:, None] * ur + v_t[:, None] * ut + rng.normal(0, 6, (N, 2))
     init = np.zeros((N, 8), 'f4')
-    init[:, 0], init[:, 1], init[:, 2], init[:, 3] = x0 + off[:, 0], y0 + off[:, 1], z0, vx
-    init[:, 4], init[:, 6], init[:, 7] = vy, -1, drag
+    init[:, 0], init[:, 1], init[:, 2] = x0 + off[:, 0], y0 + off[:, 1], z0
+    init[:, 3], init[:, 4] = v[:, 0], v[:, 1]
+    init[:, 6], init[:, 7] = -1, np.where(kind == GAS, 0.1, 0.2)                # 气体没有“迸开”的那一下，阻力很小
     c = np.array([color.redF(), color.greenF(), color.blueF()])
-    w = rng.uniform(0, 0.3, (N, 1))
+    w = rng.uniform(0, 0.25, (N, 1))
     look = np.zeros((N, 16), 'f4')
     look[:, 0:3] = init[:, 0:3]
-    look[:, 6], look[:, 7] = kind, size
+    look[:, 6] = kind
+    look[:, 7] = np.where(kind == GAS, R * rng.uniform(0.18, 0.38, N), rng.uniform(0.5, 1.3, N))
     look[:, 8:11] = c * (1 - w) + w
     look[:, 11] = rng.random(N)
-    look[:, 12] = np.where(kind == CHUNK, rng.uniform(-1.5, 1.5, N), rng.uniform(-5, 5, N))
-    look[:, 13] = np.where(kind == CHUNK, rng.uniform(0.95, 1.1, N), rng.uniform(0.85, 1.08, N)) * (0.9 + 0.1 * td)
-    look[:, 14] = rng.uniform(0, 6.28, N)
-    look[:, 15] = rng.uniform(*np.array([[0.35, 0.6], [0.5, 0.8], [1.0, 1.4]])[kind].T)      # 大块冷却得慢
+    look[:, 12] = (along + 1) / 2 * tear_s                                    # 什么时候被撕到（朝黑洞的一侧先）
+    look[:, 13], look[:, 15] = 1.0, 3.0                                       # 亮点的亮度、慢慢变暗的快慢
     return init, look
 
 

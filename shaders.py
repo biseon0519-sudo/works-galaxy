@@ -254,19 +254,11 @@ float granules(vec3 p){
     }
     return 1.0 - smoothstep(0.0, 0.9, sqrt(d1));
 }
-// 解体前的裂块：大尺度的三维细胞，返回到最近、第二近的细胞中心的距离（两者相等的地方就是裂缝）
-vec2 plates(vec3 p){
-    vec3 i = floor(p), fr = fract(p); float d1 = 9., d2 = 9.;
-    for (int x = -1; x <= 1; x++) for (int y = -1; y <= 1; y++) for (int z = -1; z <= 1; z++){
-        vec3 o = vec3(x, y, z); vec3 r = o + h33(i + o + 17.0) - fr; float d = dot(r, r);
-        if (d < d1){ d2 = d1; d1 = d; } else if (d < d2) d2 = d;
-    }
-    return vec2(sqrt(d1), sqrt(d2));
-}
 void main(){
     float R = v_p1.x, hv = v_p1.y, op = v_p1.z, act = v_p1.w, seed = v_p2.x, bright = v_p2.y;
     float doom = v_p2.z, dang = v_p2.w;
-    float crack = v_color.a;                                // 0 = 完好，1 = 马上要碎开（展开时倒过来：裂缝愈合）
+    float tide = min(v_color.a, 1.0);                       // 被潮汐拉长的程度：0 = 圆的，1 = 马上被撕开（展开时倒过来）
+    float tear = max(v_color.a - 1.0, 0.0);                 // 被撕掉了多少：从朝黑洞的一侧开始，0 → 1 整颗都化成气体
     float t = u_time;
     vec2 q = v_local / R, q0 = q;
     vec3 c = v_color.rgb;
@@ -278,8 +270,20 @@ void main(){
         q += dd * (al / (1.0 + 1.5 * doom) - al);
         c = mix(c, vec3(1.0, 0.25, 0.08), doom * 0.8);
     }
+    if (tide > 0.0){                                        // 潮汐：顺着指向黑洞的方向被拉长，两侧被挤扁
+        float al2 = dot(q, dd);
+        q = dd * al2 / (1.0 + 0.45 * tide) + (q - dd * al2) * (1.0 + 0.18 * tide);
+    }
     float r = length(q);
     float body = 1.0 - smoothstep(0.97, 1.02, r);
+    float keep = 1.0, rim = 0.0, body0 = body;              // body0：撕之前的星体范围（外圈柔光只画在它外面）
+    if (tear > 0.0){                                        // 撕开：朝黑洞的一侧先被扯掉，撕口参差不齐，撕口上一道炽热的亮边
+        float from = (1.0 - dot(q, dd)) * 0.5;              // 0 = 朝黑洞的一侧，1 = 背面
+        float front = tear * 1.3 - 0.15 + (fbm(q * 3.0 + seed * 7.0) - 0.5) * 0.35;
+        keep = smoothstep(front - 0.02, front + 0.06, from);
+        rim = exp(-pow((from - front - 0.05) / 0.05, 2.0)) * body * (1.0 - smoothstep(0.85, 1.0, tear));
+        body *= keep;
+    }
     vec3 surf = vec3(0.0);
     if (r < 1.03){
         float mu = sqrt(max(0.0, 1.0 - r * r));
@@ -306,22 +310,11 @@ void main(){
         vec3 deep = pow(cs, vec3(2.0)) * 0.9, hot = mix(cs, vec3(1.0, 0.98, 0.94), 0.5);
         vec3 sc = I < 0.6 ? mix(deep, cs, I / 0.6) : mix(cs, hot, min(1.0, (I - 0.6) / 0.6));
         surf = sc * (0.9 + 1.7 * I);
-        // 解体前：表面裂成几大块。裂缝先从一两处出现、慢慢蔓延到全身（按噪声决定哪里先裂），越裂越宽，
-        // 缝里透出炽白的光；裂开的地方附近的表面暗下去一点，看得出一块块
-        if (crack > 0.0){
-            vec2 pd = plates(s * 1.15 + seed * 11.0);
-            float gap = pd.y - pd.x;
-            float reach = smoothstep(crack * 1.3 - 0.35, crack * 1.3 - 0.1, fbm3(s * 1.4 + seed * 23.0));
-            float on = (1.0 - reach) * smoothstep(0.0, 0.15, crack);
-            float line = 1.0 - smoothstep(0.0, 0.012 + 0.05 * crack, gap);
-            float halo = 1.0 - smoothstep(0.0, 0.05 + 0.15 * crack, gap);
-            surf *= 1.0 - 0.3 * crack * on * (1.0 - halo);
-            surf += vec3(1.0, 0.93, 0.8) * (line * 2.4 + halo * 0.35) * on;
-        }
+        surf *= 1.0 + 0.2 * tide;                           // 被撕开前越来越亮（被挤压、加热）
     }
     float o = max(r - 1.0, 0.0);
     vec2 dir = q / max(r, 1e-4);
-    float lift = (0.85 + 0.4 * hv + 0.3 * act) * bright * (0.94 + 0.06 * sin(t * 1.6 + seed * 20.0));
+    float lift = (0.85 + 0.4 * hv + 0.3 * act) * bright * (0.94 + 0.06 * sin(t * 1.6 + seed * 20.0)) * (1.0 + 0.2 * tide);
     // 色球层：贴着边缘的一圈细亮边；日珥：边上一缕缕往外喷的火焰；日冕：柔光 + 放射状亮纹
     float chrom = exp(-o * 28.0) * smoothstep(0.9, 1.0, r);
     float flame = fbm3(vec3(dir * 3.2 + seed * 17.0, o * 7.0 - t * 0.3));
@@ -330,7 +323,8 @@ void main(){
     float corona = exp(-o * 4.5) * 0.7 + exp(-o * 1.4) * 0.2 * streak;
     vec3 em = (c * corona + mix(c, vec3(1.0, 0.42, 0.22), 0.55) * (prom * 1.4 + chrom * 0.8)) * lift;
     em *= 1.0 - smoothstep(3.2, 4.9, max(abs(q0.x), abs(q0.y)));      // 画到方块边缘前淡掉
-    vec3 col = surf * body * (0.85 + 0.25 * lift) + em * (1.0 - body);
+    em *= pow(1.0 - tear, 3.0);                             // 外面的柔光整体很快淡掉（不跟着撕口切，不然切出一块黑影）
+    vec3 col = surf * body * (0.85 + 0.25 * lift) + em * (1.0 - body0) + vec3(1.0, 0.85, 0.6) * rim * 2.2;
     col = 1.0 - exp(-col * 1.25);
     float shade = act * 0.45 * exp(-o * 1.3) * (1.0 - smoothstep(2.6, 4.6, max(abs(q0.x), abs(q0.y))));
     f = vec4(col * op, (body + (1.0 - body) * shade) * op);
@@ -450,7 +444,155 @@ void main(){
 }
 '''
 
-# ---------- 恒星碎片（shards.py）----------
+# ---------- 物质流（stream.py）----------
+# 坐标：以黑洞为中心、视界半径为单位，x 向右、y 向上（屏幕平面里，去掉了滚转），z 朝画面里面（和黑洞光追的相机一致）。
+# 吸积盘所在的平面法线是 u_n（随仰角变）。每颗粒子单独模拟：从恒星朝黑洞那半边被扯下来，平方反比引力，
+# 靠近黑洞时被盘“接住”——往盘面压、顺着盘的转向绕、慢慢往里旋；掉进去（或太久）就回到自己的恒星重新出发
+STREAM_COMMON = '''
+#define MAXS 32
+uniform vec4 u_star[MAXS];    // 恒星：x、y、半径，还在不在往外喷（1 / 0）
+float hsh(float x){ return fract(sin(x * 12.9898 + 78.233) * 43758.5453); }
+'''
+
+STREAM_SIM_VS = '''
+#version 330
+''' + STREAM_COMMON + '''
+uniform vec2 u_svel[MAXS];    // 恒星的速度
+uniform float u_dt, u_life, u_reset;
+uniform float u_rspx;         // 一个视界半径是多少像素（流速按屏幕像素定，全图、近景看起来一样慢悠悠）
+uniform float u_vflow, u_vdisk;               // 流速、在盘里绕的速度（像素/秒）
+uniform float u_cap;          // 从多远开始被吸积盘接住（视界半径）
+uniform int u_steps;
+uniform vec3 u_n;
+in vec4 in_a;                 // 位置 xyz，出发后过了多久（< 0 = 还在等着出发）
+in vec4 in_b;                 // 速度 xyz，第几次出发（给随机数用）
+in vec4 in_c;                 // 属于哪颗恒星，随机数，种类，大小
+out vec4 out_a; out vec4 out_b;
+void spawn(inout vec3 p, inout vec3 v, float seed, float gen, vec4 st, vec2 sv){
+    float h1 = hsh(seed * 3.1 + gen * 1.7), h2 = hsh(seed * 5.3 + gen * 2.9);
+    float h3 = hsh(seed * 7.7 + gen * 0.37), h4 = hsh(seed * 1.3 + gen * 4.1);
+    vec2 S = st.xy; float rs = max(length(S), 1e-3);
+    vec2 d = -S / rs, tc = vec2(-S.y, S.x) / rs;              // 指向黑洞；逆时针（和盘在屏幕上的转向一致）
+    float a = (h1 - 0.5) * 2.6;                                // 从恒星朝黑洞的那半边出发，口子张得和恒星一样大
+    vec2 dir = d * cos(a) + tc * sin(a);
+    p = vec3(S + dir * st.z * 0.95, (h3 - 0.5) * st.z * 0.8);
+    // 朝着黑洞慢慢出发。基本直着流向黑洞（没有固定的侧弯），弯曲只来自恒星移动时的惯性（sv），快到盘边时被盘接住、顺一点盘的转向
+    vec2 aim = -p.xy / max(length(p.xy), 1e-3);
+    v = vec3(sv + aim * u_vflow / u_rspx * (0.4 + 0.4 * h2), -p.z * 0.2);
+}
+void main(){
+    vec3 p = in_a.xyz, v = in_b.xyz;
+    float age = in_a.w, gen = in_b.w, seed = in_c.y;
+    int o = int(in_c.x);
+    vec4 st = u_star[o];
+    if (u_reset > 0.5){                                       // 重新开始：出发时间在“流过去要多久”里错开，快进完就是匀匀的一股
+        float trip = length(st.xy) * u_rspx / u_vflow;
+        age = -hsh(seed * 9.7 + gen) * min(trip, u_life); gen += 1.0; v = vec3(0.0);
+    }
+    for (int s = 0; s < u_steps; s++){
+        if (age < 0.0){                                       // 还没出发
+            age += u_dt;
+            if (age >= 0.0){
+                if (st.w > 0.5){ spawn(p, v, seed, gen, st, u_svel[o]); age = 0.0; }
+                else age = -0.2 - hsh(seed + gen) * clamp(length(st.xy) * u_rspx / u_vflow, 1.0, u_life);   // 恒星不在：等它出现，出发时间错开
+            }
+            continue;
+        }
+        float r = max(length(p), 1e-3);
+        float rs0 = max(length(st.xy), 1e-3);
+        // 慢悠悠地流过去：速度慢慢贴近“朝着黑洞、每秒 u_vflow 像素”，越靠近黑洞稍微快一点；
+        // 贴近得不快（约 0.7 秒），所以恒星挪动时，已经在路上的粒子按惯性拖出弯
+        float cap = smoothstep(u_cap, u_cap * 0.6, r);        // 吸积盘的范围：被盘接住
+        vec3 want = -p / r * u_vflow / u_rspx * (1.0 + 0.6 * (1.0 - clamp(r / rs0, 0.0, 1.0)));
+        float hgt = dot(p, u_n);
+        vec3 pin = p - u_n * hgt;
+        float rin = max(length(pin), 1e-3);
+        vec3 tdir = cross(-u_n, pin) / rin;
+        float vk = u_vdisk / u_rspx * sqrt(6.2 / max(rin, 2.0));
+        vec3 vtar = tdir * vk - pin / rin * vk * 0.25;        // 在盘里顺着盘转，同时慢慢往里旋
+        vec3 acc = (mix(want, vtar, cap) - v) * (1.5 + cap);
+        float vt = dot(v, tdir);
+        acc -= pin / rin * (vt * vt / rin) * cap;             // 绕圈要的向心力单独给，上面那项才能真的把它往里带
+        acc -= u_n * (hgt * 4.0 + dot(v, u_n) * 2.0) * cap;   // 压到盘面上
+        // 漏斗：刚出发的粒子被往“恒星—黑洞”这条线上收拢（临界阻尼），两三个恒星半径内收成细流；
+        // 出发 2.5 秒后就不管了，恒星动的时候已经在路上的粒子照样按惯性拖出弯
+        vec2 ax = -st.xy / rs0;
+        vec2 lat = p.xy - ax * dot(p.xy, ax), vlat = v.xy - ax * dot(v.xy, ax);
+        acc.xy -= (lat * 2.0 + vlat * 2.8) * (1.0 - smoothstep(1.5, 2.5, age)) * step(0.5, st.w);
+        v += acc * u_dt;
+        p += v * u_dt;
+        age += u_dt;
+        if (length(p) < 2.0 || age > u_life){                 // 掉进去了（或太久）：回到恒星重新出发
+            gen += 1.0;
+            if (st.w > 0.5){ spawn(p, v, seed, gen, st, u_svel[o]); age = 0.0; }
+            else age = -0.2 - hsh(seed + gen) * clamp(length(st.xy) * u_rspx / u_vflow, 1.0, u_life);   // 恒星不在：等它出现，出发时间错开
+        }
+    }
+    out_a = vec4(p, age); out_b = vec4(v, gen);
+}
+'''
+
+STREAM_VS = '''
+#version 330
+''' + STREAM_COMMON + '''
+uniform vec4 u_scol[MAXS];    // 恒星的颜色、这条流的透明度
+uniform vec2 u_vp;
+uniform vec3 u_bh;            // 黑洞在屏幕上的位置、一个视界半径是多少像素
+uniform float u_roll, u_alpha;
+uniform vec3 u_disk;          // 吸积盘的颜色
+in vec2 in_corner;
+in vec4 i_a;                  // 位置 xyz，出发后过了多久
+in vec4 i_c;                  // 属于哪颗恒星，随机数，种类，大小
+out vec2 v_local;
+flat out vec4 v_col;
+flat out vec2 v_kind;         // 种类、随机数
+void main(){
+    float age = i_a.w;
+    if (age < 0.0){ gl_Position = vec4(-9.0, -9.0, 0.0, 1.0); v_col = vec4(0.0); v_local = vec2(0.0); v_kind = vec2(0.0); return; }
+    vec3 p = i_a.xyz;
+    float f = 40.0 / max(40.0 + p.z, 8.0);                    // 和黑洞光追一样的透视（相机在 40 个视界半径外）
+    vec2 q = p.xy * f;
+    vec2 local = mat2(cos(u_roll), -sin(u_roll), sin(u_roll), cos(u_roll)) * vec2(q.x, -q.y) * u_bh.z;
+    int o = int(i_c.x);
+    float kind = i_c.z, sz = i_c.w, r = length(p);
+    float near = smoothstep(14.0, 3.0, r);                    // 越靠近黑洞越热、越细
+    float Rpx = u_star[o].z * u_bh.z;                         // 恒星在屏幕上的半径
+    float size = kind < 0.5 ? clamp(Rpx * sz * mix(1.0, 0.4, near), 1.5, 36.0) : max(0.7, Rpx * 0.035 * sz);
+    float ext = size * 2.0;
+    v_local = in_corner * 2.0;
+    vec2 px = u_bh.xy + local + in_corner * ext;
+    gl_Position = vec4(px.x / u_vp.x * 2.0 - 1.0, 1.0 - px.y / u_vp.y * 2.0, 0.0, 1.0);
+    float a = smoothstep(0.0, 0.3, age) * smoothstep(2.0, 2.9, r);
+    if (p.z > 0.0) a *= smoothstep(2.45, 2.8, length(q));     // 绕到黑洞后面：被挡住
+    a *= 1.0 - 0.55 * smoothstep(6.5, 3.0, r);                // 汇进盘里，和盘的光融在一起
+    vec3 col = mix(u_scol[o].rgb, u_disk, smoothstep(0.0, 1.0, near));
+    col = mix(col, vec3(1.0, 0.95, 0.88), near * near * 0.5);
+    v_col = vec4(col * (1.0 + 1.2 * near), a * u_scol[o].a * u_alpha);
+    v_kind = vec2(kind, i_c.y);
+}
+'''
+
+STREAM_FS = '''
+#version 330
+uniform float u_time;
+in vec2 v_local; flat in vec4 v_col; flat in vec2 v_kind;
+out vec4 f;
+void main(){
+    if (v_col.a <= 0.0) discard;
+    vec2 q = v_local;
+    float d2 = dot(q, q);
+    float win = 1.0 - smoothstep(1.6, 2.0, max(abs(q.x), abs(q.y)));
+    float I;
+    if (v_kind.x < 0.5) I = exp(-d2 * 1.6) * 0.04;           // 一团薄薄的发光气体，叠在一起才是浓的
+    else {                                                    // 亮点，会闪
+        float tw = 0.6 + 0.4 * sin(u_time * (3.0 + 4.0 * v_kind.y) + v_kind.y * 40.0);
+        I = exp(-d2 * 3.0) * 0.9 * tw;
+    }
+    f = vec4(v_col.rgb * I * v_col.a * win, 0.0);
+}
+'''
+
+# ---------- 恒星被黑洞撕碎（shards.py）----------
 # 模拟：transform feedback，每个顶点是一片碎片，一遍往前算 8 步（1/120 秒一步），把 8 个位置都输出来记下路线。
 # 引力按平方反比朝着黑洞；刚迸开时阻力大（清脆地停住，小碎片阻力更大、大块更“沉”），之后只有横向一点阻力，
 # 靠近黑洞时横向阻力加大（被盘里的气体拖住，不会擦过黑洞又被甩出去）
@@ -491,7 +633,7 @@ void main(){
 }
 '''
 
-# 画碎片：按时间从记下的路线里取位置（收起正着放，展开倒着放），投影到屏幕；越靠近黑洞越贴近盘面，进视界消失
+# 画撕开的气体：按时间从记下的路线里取位置（收起正着放，展开倒着放），投影到屏幕；越靠近黑洞越贴近盘面，进视界消失
 SHARD_VS = '''
 #version 330
 uniform vec2 u_vp;
@@ -504,12 +646,12 @@ uniform int u_n, u_w;     // 碎片数，路线纹理的宽度
 uniform sampler2D u_rec;
 in vec2 in_corner;
 in vec4 i_a;              // 起点 x、y、z，编号
-in vec4 i_b;              // 开始时间，路线有几步，种类（0 火星 / 1 碎片 / 2 大块），大小
+in vec4 i_b;              // 开始时间，路线有几步，种类（0 亮点 / 1 气体），大小
 in vec4 i_c;              // 颜色 r、g、b，随机数
-in vec4 i_d;              // 自转速度，初始温度，初始角度，冷却快慢（秒）
+in vec4 i_d;              // 被撕到的时刻（秒），亮点的亮度，（没用），亮点变暗的快慢（秒）
 out vec2 v_local;
 flat out vec4 v_col;      // 颜色、透明度
-flat out vec4 v_par;      // 温度、随机数、碎开那一下的闪光、种类
+flat out vec4 v_par;      // 亮点的亮度 / 气体离黑洞多近，随机数，被撕下来多久（秒），种类
 vec3 at(int k){
     if (k <= 0) return i_a.xyz;
     int j = k - 1, pass = j / 8;
@@ -519,7 +661,9 @@ vec3 at(int k){
 void main(){
     float n = i_b.y;
     float k = u_dir > 0.0 ? (u_t - i_b.x) * u_hz : n - 1.0 - (u_t - i_b.x) * u_hz;
-    if (k < 0.0 || k > n - 1.0){ gl_Position = vec4(-9.0, -9.0, 0.0, 1.0); v_col = vec4(0.0); return; }
+    if (k < 0.0 || k > n - 1.0){
+        gl_Position = vec4(-9.0, -9.0, 0.0, 1.0); v_col = vec4(0.0); v_par = vec4(0.0); v_local = vec2(0.0); return;
+    }
     int k0 = int(floor(k));
     vec3 p = mix(at(k0), at(k0 + 1), k - float(k0));
     float age = k / u_hz;
@@ -529,24 +673,22 @@ void main(){
     vec2 s = (vec2(p.x, p.y * (1.0 - 0.45 * close * close)) - u_cam.xy) * kk + u_vp * 0.5;
     float a = clamp((length(s - u_bh.xy) - u_bh.z * 0.85) / (u_bh.z * 0.5), 0.0, 1.0);
     if (u_dir > 0.0) a *= clamp((4.4 - age) / 0.6, 0.0, 1.0);      // 没掉进去的慢慢淡掉
+    a *= smoothstep(i_d.x, i_d.x + 0.1, age); // 星体被撕到这里时才出现（朝黑洞的一侧先）；展开时倒过来，气体在这里补回星体时淡掉
     float kind = i_b.z;
-    vec2 c = in_corner;
     float ext;
-    if (kind < 0.5){                          // 火星：和晶尘一样的菱形光点
+    if (kind < 0.5){                          // 亮点：和晶尘一样的菱形光点
         float sz = max(0.6, i_b.w * min(1.6, kk));
         ext = sz * 5.0;
         v_local = in_corner * 5.0;
-    } else {                                  // 碎块：按世界大小，跟着转
-        ext = max(0.8, i_b.w * kk) * 2.4;
-        v_local = in_corner * 2.4;
-        float ang = i_d.z + i_d.x * age;
-        c = mat2(cos(ang), sin(ang), -sin(ang), cos(ang)) * in_corner;
+    } else {                                  // 气体：按世界大小的一团柔光
+        ext = max(1.5, i_b.w * kk) * 2.0;
+        v_local = in_corner * 2.0;
     }
-    vec2 px = s + c * ext;
+    vec2 px = s + in_corner * ext;
     gl_Position = vec4(px.x / u_vp.x * 2.0 - 1.0, 1.0 - px.y / u_vp.y * 2.0, 0.0, 1.0);
-    float T = i_d.y * exp(-age / i_d.w);
+    float near = smoothstep(u_rs * 7.0, u_rs * 1.5, r);       // 越靠近黑洞越热、越亮
     v_col = vec4(i_c.rgb, a);
-    v_par = vec4(T, i_c.w, exp(-age * 28.0), kind);
+    v_par = vec4(kind < 0.5 ? i_d.y * exp(-age / i_d.w) : near, i_c.w, age - i_d.x, kind);
 }
 '''
 
@@ -555,57 +697,29 @@ SHARD_FS = '''
 uniform float u_time;
 in vec2 v_local; flat in vec4 v_col; flat in vec4 v_par;
 out vec4 f;
-''' + NOISE + '''
-// 炽热物体的颜色：几乎黑 → 暗红 → 橙 → 黄 → 白
-vec3 heat(float T){
-    vec3 c = mix(vec3(0.0), vec3(0.5, 0.04, 0.01), smoothstep(0.0, 0.22, T));
-    c = mix(c, vec3(1.0, 0.3, 0.05), smoothstep(0.18, 0.48, T));
-    c = mix(c, vec3(1.0, 0.7, 0.28), smoothstep(0.42, 0.75, T));
-    return mix(c, vec3(1.0, 0.96, 0.88), smoothstep(0.72, 1.05, T));
-}
 void main(){
-    float T = v_par.x, seed = v_par.y, flash = v_par.z, kind = v_par.w;
+    float heat = v_par.x, seed = v_par.y, born = v_par.z, kind = v_par.w;
     float op = v_col.a;
     if (op <= 0.0) discard;
-    // 带上恒星本来的颜色（淡色恒星先提饱和度，不然白的、淡蓝的恒星碎开是一团白）
+    // 带上恒星本来的颜色（淡色恒星先提饱和度，不然白的、淡蓝的恒星化开是一团白）
     vec3 cs = clamp(mix(vec3(dot(v_col.rgb, vec3(0.3, 0.59, 0.11))), v_col.rgb, 2.2), 0.0, 1.0);
-    vec3 tint = mix(vec3(1.0), cs * 1.3, 0.5);
     vec2 q = v_local;
+    float win = 1.0 - smoothstep(0.8, 1.0, max(abs(q.x), abs(q.y)) / (kind < 0.5 ? 5.0 : 2.0));
+    vec3 col;
     if (kind < 0.5){
-        // 火星：菱形光点 + 十字闪光，颜色按温度；加色（透明度 0）
+        // 亮点：菱形光点 + 十字闪光，会闪，慢慢变暗；加色（透明度 0）
         float dia = abs(q.x) + abs(q.y);
         float core = exp(-dia * dia * 1.2);
         float tw = 0.55 + 0.45 * sin(u_time * 9.0 + seed * 40.0);
         float spark = (exp(-abs(q.x) * 6.0) * exp(-abs(q.y) * 1.2) + exp(-abs(q.y) * 6.0) * exp(-abs(q.x) * 1.2)) * 0.35 * tw;
-        vec3 col = heat(T) * tint * (core * 1.1 + spark) * (1.0 + 1.2 * flash) + vec3(core * 0.2 * tw * min(T, 1.0));
-        float win = 1.0 - smoothstep(3.5, 5.0, max(abs(q.x), abs(q.y)));
-        f = vec4(col * op * win, 0.0);
-        return;
+        col = (mix(vec3(1.0), cs * 1.3, 0.5) * (core * 1.1 + spark) + vec3(core * 0.2 * tw)) * heat;
+    } else {
+        // 气体：一团薄薄的发光等离子体（和物质流同一种画法），叠在一起就是恒星化开的那一大片；
+        // 颜色从恒星本色慢慢变成吸积盘的暖色，越靠近黑洞越亮
+        col = mix(cs * 1.2, vec3(1.0, 0.72, 0.42), heat) * (1.0 + 1.5 * heat) * exp(-dot(q, q) * 1.6) * 0.022;
+        col *= 1.0 + 1.6 * (1.0 - smoothstep(0.0, 0.6, born));   // 刚从星体上撕下来时和星体表面差不多亮，0.6 秒内暗下来
     }
-    // 碎块：不规则的多边形（崩开的断面），表面是恒星的等离子纹理；外缘先冷却，里面和裂缝里的红热保持得久；
-    // 冷下去的部分是暗色的实心块，会挡住后面的东西
-    float rr = length(q);
-    float ang = atan(q.y, q.x);
-    float m = 5.0 + floor(seed * 3.0);
-    float seg = 6.2832 / m;
-    float poly = cos(seg * 0.5) / cos(mod(ang + seed * 6.2832, seg) - seg * 0.5);
-    vec2 dir = vec2(cos(ang), sin(ang));
-    float edge = poly * (0.9 + 0.26 * (noise(dir * 2.2 + seed * 13.0) - 0.5));
-    float d = rr - edge;
-    float aa = fwidth(rr) * 1.2;
-    float inside = 1.0 - smoothstep(-aa, aa, d);
-    float depth = clamp(1.0 - rr / max(edge, 1e-3), 0.0, 1.0);          // 边上 0，中间 1
-    float pl = fbm(q * 1.8 + seed * 31.0);
-    float vein = 1.0 - smoothstep(0.0, 0.07, abs(noise(q * 2.6 + seed * 17.0) - 0.5));
-    float Tl = T * (0.6 + 0.4 * depth) * (0.78 + 0.5 * pl);
-    Tl = max(Tl, sqrt(max(T, 0.0)) * 0.8 * vein * smoothstep(0.0, 0.3, depth));
-    vec3 em = heat(Tl) * tint * 1.15 * (1.0 + 1.2 * flash);
-    vec3 col = (v_col.rgb * 0.04 + 0.01 + em) * inside;
-    float alpha = inside * 0.95;
-    float halo = exp(-max(d, 0.0) * 4.0) * (1.0 - inside) * smoothstep(0.05, 0.6, T) * 0.22 * (1.0 + 1.5 * flash);
-    col += heat(T) * tint * halo;                                       // 外面一圈热辉光（加色）
-    float win = 1.0 - smoothstep(1.9, 2.4, max(abs(q.x), abs(q.y)));
-    f = vec4(col * op * win, alpha * op * win);
+    f = vec4(col * op * win, 0.0);
 }
 '''
 
