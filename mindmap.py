@@ -586,7 +586,21 @@ class MindMap(QOpenGLWidget):
             self.anim.dur = lead + 0.3 + BIRTH_TAIL_S + 0.1
             self._gulp_t = t0                           # 黑洞先亮一下、荡开涟漪，碎片接着冲出来
 
+    def _settle_drag(self):
+        """拖过的恒星松手后还在慢慢停稳（见 _advance）：直接放到它要去的位置、存好。要在重新排布之前做，
+        不然停稳之前它每帧都把自己的目标改回当前位置，展开时这颗恒星就不会转到该去的地方，停稳后还把错的位置存了下来。"""
+        dg, self._drag = self._drag, None
+        if dg is None:
+            return
+        n = dg['n']
+        if 'target' in dg:
+            d = dg['target'] - dg['pos']
+            n.base += QPointF(d.x() / n.k, d.y() / n.k)
+            n.polar1 = n.polar0 = (math.atan2(n.base.y(), n.base.x()), math.hypot(n.base.x(), n.base.y()))
+        self._save_star(n)
+
     def relayout(self, animate=True):
+        self._settle_drag()
         targets = self._targets()
         now = self.now()
         born, broken = [], []
