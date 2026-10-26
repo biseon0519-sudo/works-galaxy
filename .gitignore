@@ -13,3 +13,5 @@ dist/
 # 本地专用：给 Claude 的项目笔记、本机快捷方式
 CLAUDE.md
 *.lnk
+# 录屏输出（tools\record_demo.py 生成）
+录屏/
