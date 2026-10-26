@@ -17,11 +17,20 @@ VERSION = '2026.10.26'                    # 日历版本号：发布当天的日
 ACCENT = '#29c4f6'                        # 导图是深色霓虹风，界面固定用深色 + 青色主题色
 
 
+class YearSpin(SpinBox):
+    """PySide6 6.12 + qfluentwidgets 1.11 里 SpinBox 的输入区被算成 1 像素宽（数字其实在，只是看不见，换 Fusion 样式也一样）：
+    每次改大小后按样式表的内边距（左 10，右 80 留给上下箭头）自己摆。"""
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.lineEdit().setGeometry(10, 1, max(1, self.width() - 90), self.height() - 2)
+
+
 class YearDialog(MessageBoxBase):
     def __init__(self, parent, year):
         super().__init__(parent)
         self.viewLayout.addWidget(SubtitleLabel('添加年份'))
-        self.spin = SpinBox(); self.spin.setRange(1900, 2100); self.spin.setValue(year)
+        self.spin = YearSpin(); self.spin.setRange(1900, 2100); self.spin.setValue(year)
         self.viewLayout.addWidget(self.spin)
         self.yesButton.setText('添加'); self.cancelButton.setText('取消')
         self.widget.setMinimumWidth(320)
