@@ -37,17 +37,22 @@ PARALLAX = 0.016          # 展开时黑洞和星空跟着鼠标反方向微微�
 CINE_ROLL = -0.10         # 展开时黑洞稍微歪一点，更有镜头感
 CINE_STAR_X = 0.34        # 展开时恒星的位置（占宽度）：在黑洞下面偏左，挡在黑洞前面，右边留给分支
 DISK_OUT = 6.2            # 吸积盘外缘（以视界半径为单位，和着色器里的 R_OUT 一致）
-ANIM_S, BIRTH_S, CAM_S = 1.1, 1.5, 1.1     # 动画时长（秒）：普通移动、展开时恒星重建、镜头
+ANIM_S, CAM_S = 1.1, 1.1  # 动画时长（秒）：普通移动、镜头（展开时恒星重建的时长按模拟出来的算）
 # 收起（艺术化处理）：恒星先被黑洞吸过去一段、越来越快，然后像水晶胶囊一样清脆地碎开（亮一下、迸开一点点就停住），
 # 碎片再一边往里落一边顺着盘转一点被吸进去，快慢各不相同；最后一批进去时黑洞亮一下、荡开一圈涟漪
 ATTRACT_S = 0.55          # 被吸过去的时长（之后碎开）
 ATTRACT_D = 0.35          # 碎开前已经被吸过去的距离比例
 SWALLOW_S = ATTRACT_S + 0.35          # 恒星本体的动画时长（每颗恒星碎开的时间错开一点）
-SHARD_N = 70              # 每颗恒星碎成多少片
-GULP_S = 1.25             # 碎开后多久碎片基本都进去了（黑洞亮一下、荡开涟漪）
-# 展开：水晶碎片从黑洞里旋出来，飞到各自恒星的位置汇合，恒星亮一下、清脆地凝结出来
-BIRTH_N = 70
-FORM_AT = 0.72            # 展开动画进行到多少时恒星凝结（碎片大多到了）
+SHARD_N = 80              # 每颗恒星碎成多少片
+# 碎片的引力按真实的平方反比：加速度 = SHARD_G / r²，朝着黑洞（离得近的很快掉进去，远的晚一些，越靠近越快）。
+# 一开始像水晶胶囊那样清脆地往外迸开，很强的阻力让它很快慢下来；之后基本是自由下落，只有横向有一点阻力
+# （像盘里的气体拖着，损失角动量），所以横着迸出去的碎片会划一道弧、绕一点再旋进去，不会一直绕圈
+SHARD_G = 8e7
+SHARD_KT, SHARD_KR = 0.7, 0.0         # 引力接管后横向、径向的阻力（靠近黑洞时横向阻力再加大，见 _advance）
+SHARD_CARRY = 120.0       # 恒星碎开时本身正被吸过去的速度，碎片继承一部分
+# 展开 = 收起倒着放：先在新位置按收起的过程正着模拟一遍（碎开 → 引力落进黑洞），记下每片碎片的路线再倒着播放——
+# 碎片从黑洞里冲出来、越飞越慢，在恒星那里同时收拢，恒星亮一下凝结出来，再慢慢退回自己的位置；黑洞先亮一下、荡开涟漪
+SIM_HZ = 120              # 模拟、记录路线的步长（每秒多少步）
 ROPE_LAG, ROPE_K, ROPE_D = 0.5, 22.0, 6.0     # 分支光丝的惯性：端点动时控制点只跟上一部分，再靠弹簧追上
 STAR_R = 24               # 恒星半径
 STAR_ACTIVE = 1.0         # 展开的那颗恒星放大多少（近看能看清表面）
@@ -338,6 +343,7 @@ uniform float u_time;
 in vec2 v_local; flat in vec4 v_color; flat in vec4 v_p1; flat in vec4 v_p2;
 out vec4 f;
 ''' + NOISE + '''
+float fbm4(vec2 p){ float v = 0., a = .5; for (int i = 0; i < 4; i++){ v += a * noise(p); p = p * 2.03 + vec2(1.7, 9.2); a *= .5; } return v + 0.03; }
 const float R_IN = 2.3, R_OUT = 6.2;
 // 盘有厚度（不是一张纸）：半厚度内薄外厚，外缘微微鼓起
 float halfH(float rr){ return 0.04 + 0.045 * (clamp(rr, R_IN, R_OUT) - R_IN); }
@@ -354,7 +360,7 @@ vec4 disk(vec3 hit, float rr, vec3 v){
     vec2 pp2 = vec2(cos(a2), sin(a2)) * rr + 7.3 * floor(u_time / PERIOD + 0.5) + 3.7;
     float mixw = abs(1.0 - 2.0 * ph1);                     // 第一层重置时（ph1 = 0）只看第二层
     float yv = hit.y * 0.7;                                 // 不同高度的气体略有不同，看起来才有体积，不是一张纸压出来的
-    float n = mix(fbm(pp1 * 0.9 + vec2(rr * 0.6, yv)), fbm(pp2 * 0.9 + vec2(rr * 0.6, yv)), mixw);
+    float n = mix(fbm4(pp1 * 0.9 + vec2(rr * 0.6, yv)), fbm4(pp2 * 0.9 + vec2(rr * 0.6, yv)), mixw);
     n = clamp((n - 0.5) * 1.9 + 0.5, 0.0, 1.0);             // 两层混合会把明暗抵消掉一些，补回对比度
     float x = (rr - R_IN) / (R_OUT - R_IN);
     float T = pow(R_IN / rr, 0.9);                          // 越靠里越热
@@ -395,7 +401,7 @@ void main(){
         float jit = hash(gl_FragCoord.xy);                  // 每个像素的采样点错开一点，避免出现一层层的条纹
         for (int i = 0; i < 700; i++){
             float r = length(p);
-            float dt = clamp(0.045 * r, 0.012, 0.45);
+            float dt = clamp(0.05 * r, 0.012, 0.6);
             float rr = length(p.xz);
             float hh = halfH(rr);
             bool inR = rr > R_IN * 0.8 && rr < R_OUT * 1.08;
@@ -403,7 +409,7 @@ void main(){
             if (inR){
                 float gap = max(abs(p.y) - hh * 2.4, 0.0);
                 dt = min(dt, (gap + hh * 0.5) / max(abs(v.y), 1e-3));
-                if (gap == 0.0) dt = min(dt, 0.14);
+                if (gap == 0.0) dt = min(dt, 0.2);         // 在盘里每步 0.2（再小看不出区别，只是更费显卡）
                 dt = max(dt, 0.008);
             }
             v += -1.5 * h2 * p / pow(r, 5.0) * dt;
@@ -425,7 +431,7 @@ void main(){
             p = pn;
             if (dot(p, p) < 1.0){ captured = true; break; }
             if (r > RB + 1.0 && dot(p, v) > 0.0) break;
-            if (trans < 0.02) break;
+            if (trans < 0.03) break;
         }
         if (captured) trans = 0.0;
         else {                // 光子环：贴着光子球（1.5 倍视界）绕过的光，阴影边上一圈锐利的细亮线
@@ -674,57 +680,6 @@ void main(){
 }
 '''
 
-# 星尘粒子：CPU 只在产生时上传一次起点、终点和时间，之后每帧的位置都由显卡按时间算（CPU、GPU 各干各的）。
-# mode 2 = 收起：恒星的水晶碎片迸开一点后被吸进黑洞；mode 3 = 展开：碎片从黑洞里旋出来、飞到恒星的位置汇合。
-# 都画成菱形闪光（像水晶胶囊的晶尘），片元用 DUST_FS
-PARTICLE_VS = '''
-#version 330
-uniform vec2 u_vp;
-uniform vec3 u_cam;       // 镜头看向的世界坐标 x、y，缩放
-uniform vec3 u_bh;        // 黑洞在屏幕上的位置、阴影半径（像素）
-uniform float u_time;
-in vec2 in_corner;
-in vec4 a_from; in vec4 a_to; in vec4 a_time; in vec4 a_look; in vec4 a_misc;
-out vec2 v_local; flat out vec4 v_color; flat out vec4 v_p1; flat out vec4 v_p2;
-const float FOCAL = ''' + str(FOCAL) + ''';
-vec2 proj(vec3 p){ float k = u_cam.z * FOCAL / (FOCAL - p.z); return (p.xy - u_cam.xy) * k + u_vp * 0.5; }
-vec2 at(float t){
-    if (a_time.z < 2.5){
-        // 碎片：先清脆地迸开一小下（很快停住），等一会儿再一边往里落一边顺着盘转一点，越靠里越贴近盘面
-        float tau = max(t - a_time.x, 0.0);
-        vec2 S = a_from.xy + a_to.xy * (1.0 - exp(-tau * 9.0));
-        float e = pow(clamp((tau - a_time.w) / a_time.y, 0.0, 1.0), 1.8);
-        float r = length(S) * (1.0 - e), th = atan(S.y, S.x) - a_to.z * pow(e, 1.3);
-        return proj(vec3(r * cos(th), r * sin(th) * mix(1.0, 0.4, e), a_from.z * (1.0 - e)));
-    }
-    // 展开：从黑洞边上反着旋出来（先快后慢），越往外越离开盘面，最后落到恒星圆面上的一点
-    float e = 1.0 - pow(1.0 - clamp((t - a_time.x) / a_time.y, 0.0, 1.0), 2.4);
-    vec2 T = a_to.xy;
-    float r = mix(a_from.x, length(T), e), th = atan(T.y, T.x) + a_to.z * pow(1.0 - e, 1.3);
-    return proj(vec3(r * cos(th), r * sin(th) * mix(0.4, 1.0, e), a_to.w * e));
-}
-void main(){
-    float t = u_time, inward = step(1.5, a_time.z) * step(a_time.z, 2.5);
-    float u = (t - a_time.x - inward * a_time.w) / a_time.y;
-    vec2 s = at(t);
-    float alpha = smoothstep(u_bh.z * 0.85, u_bh.z * 1.35, length(s - u_bh.xy));     // 在黑洞阴影里看不见
-    if (inward > 0.5){        // 收起：碎开那一刻就出现，进了视界消失
-        if (t < a_time.x || u >= 1.0) alpha = 0.0;
-    } else {                  // 展开：到了恒星那里一下子收拢消失，交给凝结出来的恒星
-        alpha *= 1.0 - smoothstep(0.88, 1.0, u);
-        if (u < 0.0 || u >= 1.0) alpha = 0.0;
-    }
-    float size = a_look.w * max(0.8, u_cam.z);
-    float ext = alpha > 0.0 ? size * 5.0 : 0.0;      // 看不见的退化成一个点，不画
-    v_local = in_corner * ext;
-    v_color = vec4(a_look.rgb, 1.0);
-    v_p1 = vec4(size, alpha, a_misc.z, 0.0);
-    v_p2 = vec4(0.0);
-    vec2 px = s + in_corner * ext;
-    gl_Position = vec4(px.x / u_vp.x * 2.0 - 1.0, 1.0 - px.y / u_vp.y * 2.0, 0, 1);
-}
-'''
-
 DOWN_FS = '''
 #version 330
 uniform sampler2D u_tex;
@@ -948,10 +903,11 @@ class MindMap(QOpenGLWidget):
         self._anim_moving = False       # 这次动画里有没有东西在飞（只是淡入淡出就不用藏连线）
         # 晶尘粒子，每行：世界 x、y，速度 x、y，剩余寿命，总寿命，大小，颜色 r、g、b，闪烁相位
         self.dust = np.zeros((0, 11), 'f4')
-        # 坠入、喷出的星尘（位置由显卡按时间算），每行 20 个数：起点 x、y、z、空，终点 x、y、z、空，
-        # 开始时间、时长、模式（0 坠入 / 1 喷出）、亮起时间，颜色 r、g、b、大小，随机数、偏移、闪烁相位、空
-        self.parts = np.zeros((0, 20), 'f4')
         self._gulp_t = -99.0            # 碎片差不多都被吸进去的时间（黑洞亮一下、荡开涟漪）
+        # 恒星碎开的水晶碎片（受引力），每行：世界 x、y、z，速度 x、y，已过时间，大小，颜色 r、g、b，闪烁相位
+        self.shards = np.zeros((0, 11), 'f4')
+        self._shard_peak = 0            # 这一次收起最多有多少碎片（剩得很少时算“吞完了”）
+        self.rebirth = None             # 展开时倒着播放的碎片路线（见 _emit_rebirth）
         self._rope_t = 0.0
 
         self.anim = Tween()             # 节点移动（展开、收起、飞出、被吞）
@@ -1126,42 +1082,80 @@ class MindMap(QOpenGLWidget):
         new = np.column_stack([x, y, vx, vy, life, life, rng.uniform(0.5, 1.6, cnt), col, rng.random(cnt)]).astype('f4')
         self.dust = np.concatenate([self.dust, new])
 
-    def _emit(self, rows):
-        self.parts = np.concatenate([self.parts, rows.astype('f4')])
-        self._parts_dirty = True
-
-    def _emit_shards(self, n, now):
-        """恒星碎开：撒一把水晶碎片，迸开一小下就停住，等一会儿再各自被吸进黑洞（位置由显卡按时间算）。"""
+    def _shard_state(self, n, x0, y0, z0):
+        """恒星在 (x0, y0) 碎开时的碎片：像水晶胶囊那样清脆地往外迸一小下，带着恒星本来被吸过去的速度。
+        每行：x、y、z，速度 x、y，已过时间，大小，颜色 r、g、b，闪烁相位。"""
         rng = np.random.default_rng()
         N = SHARD_N
         off = rng.normal(0, 0.4, (N, 2)) * STAR_R
-        burst = rng.normal(0, 3.5, (N, 2)) + off * 0.12        # 只迸开一点点，方向乱一点（不要整齐地往外炸成一圈）
+        norm = np.hypot(off[:, 0], off[:, 1]) + 1e-3
+        ang = rng.normal(0, 0.6, N)                     # 方向带点随机，不是整齐地往外
+        ux, uy = off[:, 0] / norm, off[:, 1] / norm
+        sp = rng.uniform(60, 170, N)
+        r0 = math.hypot(x0, y0) or 1.0
+        carry = SHARD_CARRY * rng.uniform(0.7, 1.3, N)
+        vx = (ux * np.cos(ang) - uy * np.sin(ang)) * sp - x0 / r0 * carry + rng.normal(0, 15, N)
+        vy = (ux * np.sin(ang) + uy * np.cos(ang)) * sp - y0 / r0 * carry + rng.normal(0, 15, N)
         c = np.array([n.color.redF(), n.color.greenF(), n.color.blueF()])
         col = c * (1 - (w := rng.uniform(0, 0.3, (N, 1)))) + w
         z = np.zeros(N)
-        self._emit(np.column_stack([n.base.x() + off[:, 0], n.base.y() + off[:, 1], z + n.z, z,
-                                    burst, rng.uniform(0.3, 1.3, N), z,
-                                    z + now, rng.uniform(0.6, 1.1, N), z + 2, rng.uniform(0.08, 0.35, N),
-                                    col, rng.uniform(0.9, 2.0, N), rng.random(N), z, rng.random(N), z]))
-        self._gulp_t = max(self._gulp_t, now + GULP_S)
+        return np.column_stack([x0 + off[:, 0], y0 + off[:, 1], z + z0, vx, vy, z,
+                                rng.uniform(0.6, 1.7, N), col, rng.random(N)]).astype('f4')
 
-    def _emit_birth(self, n, pos, z_to, now):
-        """恒星重建：水晶碎片从黑洞边上旋出来，飞到恒星圆面上（位置由显卡按时间算）。"""
+    @staticmethod
+    def _shard_physics(d, dt):
+        """碎片往前走 dt 秒：平方反比引力朝着黑洞；刚迸开时阻力大（清脆地停住），之后只有横向一点阻力，进到吸积盘范围横向阻力加大。"""
+        x, y = d[:, 0], d[:, 1]
+        r = np.hypot(x, y) + 1e-3
+        ux, uy = -x / r, -y / r
+        acc = SHARD_G / np.maximum(r, RS * 1.2) ** 2
+        d[:, 3] += ux * acc * dt
+        d[:, 4] += uy * acc * dt
+        early = 2.8 * np.exp(-d[:, 5] * 2.5)
+        vr = d[:, 3] * ux + d[:, 4] * uy
+        tx, ty = d[:, 3] - vr * ux, d[:, 4] - vr * uy
+        vr *= np.exp(-(early + SHARD_KR) * dt)
+        disk = 5.0 * np.clip((RS * 4.0 - r) / (RS * 3.0), 0, 1)     # 被盘里的气体拖住，不会擦过黑洞又被甩出去
+        ft = np.exp(-(early + SHARD_KT + disk) * dt)
+        d[:, 3], d[:, 4] = vr * ux + tx * ft, vr * uy + ty * ft
+        d[:, 0] += d[:, 3] * dt
+        d[:, 1] += d[:, 4] * dt
+        d[:, 2] *= math.exp(-2.0 * dt)                  # 慢慢落到黑洞所在的那一层
+        d[:, 5] += dt
+
+    def _emit_shards(self, n):
+        """收起：恒星碎开，碎片交给引力（见 _advance）。"""
+        self.shards = np.concatenate([self.shards, self._shard_state(n, n.base.x(), n.base.y(), n.z)])
+        self._shard_peak = max(self._shard_peak, len(self.shards))
+
+    def _emit_rebirth(self, nodes, now):
+        """展开：把每颗新恒星“从新位置被吞掉”的过程正着模拟一遍，记下碎片路线，之后倒着播放。
+        碎片吞得越晚的倒放时越早出发，同一颗恒星的碎片在同一刻收拢。返回整个展开动画要多久（秒）。"""
         rng = np.random.default_rng()
-        N = BIRTH_N
-        off = rng.normal(0, 0.35, (N, 2)) * STAR_R
-        c = np.array([n.color.redF(), n.color.greenF(), n.color.blueF()])
-        col = c * (1 - (w := rng.uniform(0, 0.3, (N, 1)))) + w
-        z = np.zeros(N)
-        T0 = BIRTH_S * FORM_AT                          # 碎片在恒星凝结前后陆续到达
-        dur = rng.uniform(0.55, 0.85, N)
-        self._emit(np.column_stack([rng.uniform(RS * 0.8, RS * 1.2, N), z, z, z,
-                                    pos.x() + off[:, 0], pos.y() + off[:, 1], rng.uniform(0.4, 1.4, N), z + z_to,
-                                    now + T0 - dur * rng.uniform(0.85, 1.1, N), dur, z + 3, z,
-                                    col, rng.uniform(0.9, 2.0, N), rng.random(N), z, rng.random(N), z]))
+        pr = ATTRACT_D
+        states = [self._shard_state(n, n.base.x() * (1 - pr), n.base.y() * (1 - pr), n.z * (1 - pr)) for n in nodes]
+        d = np.concatenate(states)                      # 所有恒星的碎片一起模拟（一次算完，点下去不卡）
+        owner = np.repeat(np.arange(len(nodes)), [len(x) for x in states])
+        rec, done = [], np.full(len(d), -1)
+        for k in range(5 * SIM_HZ):
+            rec.append(d[:, :3].copy())
+            done[(done < 0) & (np.hypot(d[:, 0], d[:, 1]) < RS * 0.85)] = k
+            if (done >= 0).all():
+                break
+            self._shard_physics(d, 1 / SIM_HZ)
+        done[done < 0] = len(rec) - 1
+        lead = len(rec) / SIM_HZ                        # 最慢的碎片也来得及从黑洞飞回来
+        birth = np.array([lead + rng.uniform(0.0, 0.3) for _ in nodes])   # 每颗恒星凝结的时刻（相对动画开始），错开一点
+        for n, b in zip(nodes, birth):
+            n.birth_at = b
+        self.rebirth = dict(P=np.stack(rec, 1).astype('f4'), n=done, start=now + birth[owner] - done / SIM_HZ,
+                            look=d[:, 6:11].copy())
+        self._gulp_t = now                              # 黑洞先亮一下、荡开涟漪，碎片接着冲出来
+        return lead + 0.3 + ATTRACT_S + 0.1
 
     def relayout(self, animate=True):
         targets = self._targets()
+        born = []
         for key, (kind, parent, text, sub, color, data, pos, polar, z) in targets.items():
             node = self.nodes.get(key)
             if node is None or node.removing:
@@ -1173,12 +1167,12 @@ class MindMap(QOpenGLWidget):
                 node.opacity = 0.0 if animate else 1.0
                 node.fresh = animate
                 self.nodes[key] = node
-                if polar is not None:       # 新出来的年份不飞：就在自己的位置上，由黑洞喷出来的星尘凝聚出来
+                if polar is not None:       # 新出来的年份：由黑洞喷出来的碎片在新位置附近凝结，再退回自己的位置
                     node.polar0, node.base, node.z = polar, QPointF(pos), z
                     if animate:
                         node.form = 0.0
                         node.set_content(text, sub, color, data)
-                        self._emit_birth(node, pos, z, self.clock.elapsed() / 1000)
+                        born.append(node)
             elif polar is not None:
                 node.polar0 = (math.atan2(node.base.y(), node.base.x()), math.hypot(node.base.x(), node.base.y()))
             node.parent_key = parent
@@ -1213,8 +1207,9 @@ class MindMap(QOpenGLWidget):
         if animate:
             self._anim_moving = moving          # 有东西在飞：连线先隐藏，快停稳时再出现
             years_out = any(n.removing and n.kind == 'year' for n in self.nodes.values())
-            years_in = any(n.fresh and n.kind == 'year' for n in self.nodes.values())
-            self.anim.start(self.clock.elapsed() / 1000, SWALLOW_S if years_out else BIRTH_S if years_in else ANIM_S)
+            now = self.clock.elapsed() / 1000
+            dur = self._emit_rebirth(born, now) if born else (SWALLOW_S if years_out else ANIM_S)
+            self.anim.start(now, dur)
         else:
             self.anim.stop()
             self._step(1.0); self._finish()
@@ -1240,7 +1235,7 @@ class MindMap(QOpenGLWidget):
                 n.d = [0.0, 0.0]
                 if u >= 1.0 and not n.shattered:
                     n.shattered = True
-                    self._emit_shards(n, self._last_t)        # 用这一帧的时间，碎片在同一帧出现
+                    self._emit_shards(n)
                 n.opacity = 0.0 if n.shattered else n.o0
                 continue
             k = t
@@ -1251,10 +1246,18 @@ class MindMap(QOpenGLWidget):
                 n.base = QPointF(lerp(n.p0.x(), n.p1.x(), k), lerp(n.p0.y(), n.p1.y(), k))
             n.z = lerp(n.z0, n.z1, t)
             n.opacity = max(0.0, min(1.0, lerp(n.o0, n.o1, t)))
-            if n.fresh and n.kind == 'year':        # 碎片到齐时恒星一下子凝结出来，亮一下
-                n.opacity = smooth(FORM_AT - 0.05, FORM_AT + 0.03, raw)
-                n.form = smooth(FORM_AT - 0.05, FORM_AT + 0.08, raw)
-                n.flash = smooth(FORM_AT - 0.05, FORM_AT, raw) * (1 - smooth(FORM_AT + 0.02, 1.0, raw))
+            if n.fresh and n.kind == 'year' and n.polar1 is not None:
+                # 收起倒着放：碎片收拢的一刻恒星亮一下、清脆地凝结，再从被吸过去的位置慢慢退回自己的位置（越退越慢）
+                tau = raw * self.anim.dur - getattr(n, 'birth_at', 0.0)
+                u = 1 - min(1.0, max(0.0, tau) / ATTRACT_S)
+                pr = ATTRACT_D * u * u
+                a, r = n.polar1
+                n.base = QPointF(r * math.cos(a) * (1 - pr), r * math.sin(a) * (1 - pr))
+                n.z = n.z1 * (1 - pr)
+                n.opacity = smooth(-0.02, 0.04, tau)
+                n.form = smooth(-0.02, 0.08, tau)
+                n.flash = smooth(-0.05, 0.0, tau) * (1 - smooth(0.05, 0.5, tau))
+                n.doom = 0.05 * u
 
     def _finish(self):
         for key in [k for k, n in self.nodes.items() if n.removing]:
@@ -1262,13 +1265,14 @@ class MindMap(QOpenGLWidget):
         for n in self.nodes.values():
             n.polar0 = n.polar1
             n.fresh = False
-            n.form, n.flash = 1.0, 0.0
+            n.form, n.flash, n.doom = 1.0, 0.0, 0.0
             if n.polar1 is not None:
                 a, r = n.polar1
                 n.base = QPointF(r * math.cos(a), r * math.sin(a))
             else:
                 n.base = QPointF(n.p1)
             n.z, n.opacity = n.z1, n.o1
+        self.rebirth = None                     # 展开的碎片都已经收拢成恒星了
         self.update()
 
     # ---------- 投影：世界坐标（x, y, z）→ 屏幕像素 ----------
@@ -1384,11 +1388,6 @@ class MindMap(QOpenGLWidget):
             fmt = ' '.join('4f' if a in prog else '16x' for a in ('i_rect', 'i_color', 'i_p1', 'i_p2')) + '/i'
             vao = ctx.vertex_array(prog, [(quad, '2f', 'in_corner'), (inst, fmt, *names)])
             self.sprites[name] = (prog, inst, vao)
-        self.p_parts = ctx.program(vertex_shader=PARTICLE_VS, fragment_shader=DUST_FS)
-        self.parts_buf = ctx.buffer(reserve=20 * 4 * 2048, dynamic=True)
-        self.v_parts = ctx.vertex_array(self.p_parts, [(quad, '2f', 'in_corner'),
-                                                       (self.parts_buf, '4f 4f 4f 4f 4f/i', 'a_from', 'a_to', 'a_time', 'a_look', 'a_misc')])
-        self._parts_dirty = True
         self.p_beam = ctx.program(vertex_shader=BEAM_VS, fragment_shader=BEAM_FS)
         self.beam_buf = ctx.buffer(reserve=4 * 11 * 6 * BEAM_SEG * 64, dynamic=True)
         self.v_beam = ctx.vertex_array(self.p_beam, [(self.beam_buf, '2f 1f 1f 1f 1f 1f 4f', 'in_pos', 'in_x', 'in_w', 'in_along',
@@ -1570,8 +1569,12 @@ class MindMap(QOpenGLWidget):
                 continue
             gl = max(n.glow, 1.0 if n.active else 0.0)
             if n.kind == 'center':
-                ft = self.clock.elapsed() / 1000 - self._gulp_t      # 碎片被吸进去时黑洞亮一下
-                gl = max(gl, smooth(-0.6, 0.0, ft) * (1 - smooth(0.3, 1.4, ft)))
+                if len(self.shards):                    # 碎片落到黑洞附近越多越亮
+                    near = np.hypot(self.shards[:, 0], self.shards[:, 1]) < RS * 3
+                    gl = max(gl, min(1.0, float(near.sum()) / 120))
+                ft = self.clock.elapsed() / 1000 - self._gulp_t      # 吞完后慢慢暗回去
+                if ft >= 0:
+                    gl = max(gl, 1 - smooth(0.0, 1.2, ft))
                 rs_px = n.rpx / 2.6                     # 看到的阴影比视界大 2.6 倍（光线被弯过来）
                 half = rs_px * 11
                 e = self.cine * self.cine * (3 - 2 * self.cine)
@@ -1617,16 +1620,6 @@ class MindMap(QOpenGLWidget):
             if items:
                 self._draw(name, np.array(items, 'f4'), False, vw, vh, t)
 
-        if len(self.parts):
-            if self._parts_dirty:
-                data = self.parts.tobytes()
-                if len(data) > self.parts_buf.size:
-                    self.parts_buf.orphan(len(data) * 2)
-                self.parts_buf.write(data)
-                self._parts_dirty = False
-            ctx.blend_func = moderngl.ONE, moderngl.ONE
-            self._set(self.p_parts, u_vp=(vw, vh), u_cam=(self.cam_c.x(), self.cam_c.y(), self.cam_s), u_bh=bh, u_time=t)
-            self.v_parts.render(moderngl.TRIANGLE_STRIP, instances=len(self.parts))
         if len(self.dust):
             d = self.dust
             sx = (d[:, 0] - self.cam_c.x()) * self.cam_s + vw / 2
@@ -1636,6 +1629,19 @@ class MindMap(QOpenGLWidget):
             z = np.zeros_like(sx)
             self._draw('dust', np.column_stack([sx, sy, size * 5, size * 5, d[:, 7], d[:, 8], d[:, 9], z + 1, size, a, d[:, 10],
                                                 z, z, z, z, z]), True, vw, vh, t)
+        if len(self.shards):
+            d = self.shards
+            self._draw_shards(d[:, 0], d[:, 1], d[:, 2], d[:, 6:11], np.clip(4.4 - d[:, 5], 0, 0.6) / 0.6, vw, vh, t)
+        if self.rebirth is not None:            # 展开：倒着播放记下的路线
+            rb = self.rebirth
+            k = rb['n'] - 1 - (t - rb['start']) * SIM_HZ
+            vis = (k >= 0) & (k <= rb['n'] - 1)
+            if vis.any():
+                k = k[vis]; k0 = np.floor(k).astype(int); f = (k - k0)[:, None]
+                k1 = np.minimum(k0 + 1, rb['P'].shape[1] - 1)
+                idx = np.nonzero(vis)[0]
+                pos = rb['P'][idx, k0] * (1 - f) + rb['P'][idx, k1] * f
+                self._draw_shards(pos[:, 0], pos[:, 1], pos[:, 2], rb['look'][vis], 1.0, vw, vh, t)
         labels = self._label_instances(dpr * ss)
         if len(labels):
             self.atlas[0].use(0)
@@ -1654,6 +1660,21 @@ class MindMap(QOpenGLWidget):
         f.glActiveTexture(0x84C0); f.glBindTexture(0x0DE1, 0)         # GL_TEXTURE0、GL_TEXTURE_2D
         f.glBindSampler(0, 0)
         f.glPixelStorei(0x0CF5, 4); f.glPixelStorei(0x0D05, 4)        # 解包 / 打包对齐恢复默认
+
+    def _draw_shards(self, x, y, z, look, fade, vw, vh, t):
+        """画水晶碎片（世界坐标 → 屏幕）：越靠近黑洞越贴近盘面，进视界消失；look = 大小、颜色 r、g、b、闪烁相位。"""
+        bh = self.bh
+        r = np.hypot(x, y)
+        close = np.clip((RS * 4 - r) / (RS * 2.5), 0, 1)
+        yv = y * (1 - 0.45 * close * close)             # 越靠近黑洞越贴近盘面（看起来被压扁）
+        k = self.cam_s * FOCAL / (FOCAL - z)
+        sx = (x - self.cam_c.x()) * k + vw / 2
+        sy = (yv - self.cam_c.y()) * k + vh / 2
+        size = np.maximum(0.6, look[:, 0] * np.minimum(1.6, k))
+        a = np.clip((np.hypot(sx - bh[0], sy - bh[1]) - bh[2] * 0.85) / (bh[2] * 0.5), 0, 1) * fade
+        z0 = np.zeros_like(sx)
+        self._draw('dust', np.column_stack([sx, sy, size * 5, size * 5, look[:, 1], look[:, 2], look[:, 3], z0 + 1, size, a,
+                                            look[:, 4], z0, z0, z0, z0, z0]), True, vw, vh, t)
 
     def _draw(self, name, inst, additive, vw, vh, t, **uniforms):
         """一次画一批同种精灵（每行一个实例的参数）。additive：加色混合（发光的粒子），否则按预乘透明度叠上去。"""
@@ -1773,7 +1794,8 @@ class MindMap(QOpenGLWidget):
     # ---------- 每一帧 ----------
     def _advance(self, now):
         """每帧画之前推进所有会动的东西（按真实时间，和屏幕刷新同步）。"""
-        dt = min(0.05, max(0.0, now - self._last_t)); self._last_t = now
+        raw_dt = min(0.25, max(0.0, now - self._last_t))
+        dt = min(0.05, raw_dt); self._last_t = now
         if self.anim.running:
             raw = self.anim.raw(now)
             self._step(raw)
@@ -1820,19 +1842,25 @@ class MindMap(QOpenGLWidget):
                 if abs(n.glow - want) <= 0.005:
                     n.glow = want
         self._busy = (self.anim.running or self.cam.running or 0.0 < self.link_fade < 1.0 or now - self._last_input < IDLE_AFTER
-                      or self.cine != self._cine_target() or len(self.parts) > 0 or len(self.dust) > 0
-                      or now - self._gulp_t < 1.8
+                      or self.cine != self._cine_target() or self.rebirth is not None or len(self.dust) > 0
+                      or now - self._gulp_t < 1.8 or len(self.shards) > 0
                       or any(n.v[0] or n.v[1] or n.glow != (1.0 if n.hover else 0.0) for n in self.nodes.values()))
-        if len(self.parts):                     # 星尘的位置由显卡算，这里只去掉已经结束的（碎片还要加上等待的时间）
-            alive = self.parts[:, 8] + self.parts[:, 9] + np.where(self.parts[:, 10] == 2, self.parts[:, 11], 0) > now - 0.05
-            if not alive.all():
-                self.parts = self.parts[alive]
-                self._parts_dirty = True
-        if len(self.dust):                      # 晶尘：慢慢飘散、减速，寿命到了就去掉
+        if len(self.shards):                    # 碎片：迸开 → 引力接管，旋进黑洞
+            # 按真实经过的时间分成小步积分：卡了一下（或截图）之后也能追上，不会变慢
+            steps = max(1, math.ceil(raw_dt * SIM_HZ))
+            dt_s = raw_dt / steps
+            d = self.shards
+            for _ in range(steps):
+                self._shard_physics(d, dt_s)
+            self.shards = d[(np.hypot(d[:, 0], d[:, 1]) > RS * 0.85) & (d[:, 5] < 5.0)]
+            if len(self.shards) <= self._shard_peak * 0.12 and self._shard_peak:
+                self._gulp_t = now                      # 差不多都吞进去了：黑洞亮一下，荡开一圈涟漪
+                self._shard_peak = 0
+        if len(self.dust):                      # 晶尘：慢慢飘散、减速，寿命到了就去掉（按真实经过的时间）
             d = self.dust
-            d[:, 0:2] += d[:, 2:4] * dt
-            d[:, 2:4] *= math.exp(-2.6 * dt)
-            d[:, 4] -= dt
+            d[:, 0:2] += d[:, 2:4] * raw_dt
+            d[:, 2:4] *= math.exp(-2.6 * raw_dt)
+            d[:, 4] -= raw_dt
             self.dust = d[d[:, 4] > 0]
 
     def _next_frame(self):
@@ -1995,7 +2023,7 @@ class MindMap(QOpenGLWidget):
 
     def busy_animating(self):
         """收起、展开的动画还没结束（包括碎片还在往黑洞里落）：这时点年份、分类、黑洞都不理，免得收放叠在一起。"""
-        return self.anim.running or self.clock.elapsed() / 1000 < self._gulp_t + 0.3 or \
+        return self.anim.running or len(self.shards) > 0 or self.clock.elapsed() / 1000 < self._gulp_t + 0.3 or \
             any(n.fresh for n in self.nodes.values())
 
     def click(self, n):

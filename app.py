@@ -1,5 +1,5 @@
 # 年度作品：按年份记录每年喜欢的作品（音乐、小说、综艺……），放射状思维导图显示；可以从 MarginNote 导出的导图导入
-import os, sys, threading, datetime, traceback
+import os, sys, gc, threading, datetime, traceback
 from PySide6.QtGui import QIcon, QFontDatabase, QGuiApplication, QCursor
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QWidget, QFileDialog
 if __name__ == '__main__' and QApplication.instance() is None:
@@ -207,6 +207,8 @@ def main():
         return
     win = App()
     show_window(win)
+    # 启动时建的对象（界面库、字体、着色器……）不会变成垃圾：冻结起来，之后垃圾回收不再反复扫它们，动画中不会突然卡几毫秒
+    gc.collect(); gc.freeze()
     sys.exit(app.exec())
 
 
