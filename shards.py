@@ -7,7 +7,8 @@ import moderngl
 from shaders import SHARD_SIM_VS, SHARD_VS, SHARD_FS
 
 SIM_HZ = 120              # 模拟、记录路线的步长（每秒多少步）
-SIM_STEPS = 5 * SIM_HZ    # 最多模拟 5 秒（没掉进去的气体 4.4 秒后淡掉）
+SIM_STEPS = 7 * SIM_HZ    # 最多模拟 7 秒（没掉进去的气体 FADE_AT 秒后淡掉）
+FADE_AT = 6.4
 PER_PASS = 8              # 显卡每一遍算几步（和 SHARD_SIM_VS 一致）
 STRIDE = 10 * 16          # 每团气体每一遍输出的字节数：状态 2 个 vec4 + 8 个位置
 TEX_W = 8192              # 路线纹理的宽度（一遍的数据按顺序铺进去，取的时候按编号算位置）
@@ -19,7 +20,7 @@ SHARD_CARRY = 120.0       # 恒星被撕开时本身正被吸过去的速度
 ORBIT = 0.55              # 恒星绕黑洞走的速度（圆轨道速度的几成），顺着吸积盘转的方向
 TIDAL = 90.0              # 潮汐：撕开那一刻，近的一侧已经比远的一侧走得快（拉长）、两侧往中间挤
 SPARK, GAS, CLOUD = 0, 1, 2
-PER_STAR = (700, 120, 5)              # 每颗恒星化成多少团气体、亮点，撕开的地方留下几团残留气云
+PER_STAR = (450, 80, 5)               # 每颗恒星化成多少团气体、亮点，撕开的地方留下几团残留气云（再多就太密太亮）
 CLOUD_S = 2.4             # 残留气云持续多久（秒）：它留在原地，不按模拟的路线走
 WEIGHT = np.array([0.3, 1.0, 0.0], 'f4')          # 算“吞了多少”、黑洞被照亮多少时，亮点分量轻，气云不算
 
@@ -36,11 +37,14 @@ def tidal(r):
     return t * t * (3 - 2 * t)
 
 
-def debris(rng, color, x0, y0, z0, R, long_=1.0, thin=1.0, tear_s=0.0, extras=True):
+def debris(rng, color, x0, y0, z0, R, long_=1.0, thin=1.0, tear_s=0.0, extras=True, g=SHARD_G, orbit=ORBIT, tidal_k=TIDAL,
+           straight=False, carry=SHARD_CARRY, burst=None):
     """一颗半径 R 的恒星在世界坐标 (x0, y0, z0) 被撕开时化成的气体。离黑洞越近，拉得越长。
     long_、thin：撕开那一刻星体已经顺着黑洞方向被拉长、两侧被挤扁的比例，气体就铺在同样的椭圆里，接得上。
     tear_s：星体从朝黑洞的一侧到背面被撕完要多久，每团气体等撕到它那里才出现。
-    extras：要不要残留气云。
+    extras：要不要残留气云。g、orbit、tidal_k：引力强度、绕黑洞走的速度、潮汐拉开的力度（收起时调得更慢、更有拉扯感）。
+    straight：只沿“黑洞—恒星”方向运动、不绕不弯（展开用：倒着放就是从黑洞沿直线喷出、先快后慢）。
+    carry：整颗恒星本来被吸过去的速度。burst：(最小, 最大) 原地解体时往外迸的速度，迸一下就被阻力刹住（收起用）。
     返回 (模拟的初始状态 (N, 8)，画用的参数 (N, 16))；画用参数里的编号、开始时间、步数之后再填。"""
     r0 = math.hypot(x0, y0) or 1.0
     ur = np.array([x0 / r0, y0 / r0])           # 从黑洞指向恒星
@@ -55,16 +59,29 @@ def debris(rng, color, x0, y0, z0, R, long_=1.0, thin=1.0, tear_s=0.0, extras=Tr
     rad[kind == CLOUD] *= 0.5                                                 # 气云挤在中间
     along, side = rad * np.cos(th), rad * np.sin(th)                          # 沿着 / 垂直于“黑洞—恒星”方向的位置（-1~1）
     off = (along * R * long_)[:, None] * ur + (side * R * thin)[:, None] * ut
-    vc = math.sqrt(SHARD_G / r0)
+    vc = math.sqrt(g / r0)
     # 整颗恒星一起：被吸过去 + 绕着黑洞走；各部分之间：近的一侧往里冲、远的一侧落在后面（拉长），
     # 近的一侧绕得也快一点（剪切，拉出来的一条是弯的），两侧往中间挤
-    v_r = -SHARD_CARRY * rng.uniform(0.9, 1.1) + along * TIDAL * (0.5 + td)
-    v_t = vc * ORBIT * (1 - 0.3 * along) - side * 30.0
-    v = v_r[:, None] * ur + v_t[:, None] * ut + rng.normal(0, 6, (N, 2))
+    v_r = -carry * rng.uniform(0.9, 1.1) + along * tidal_k * (0.5 + td)
+    if straight:
+        # 每团气体沿“它所在的位置—黑洞”的直线运动（不加任何横向速度），倒着放就是从黑洞沿直线喷出来
+        pos = np.array([x0, y0]) + off
+        dirs = pos / np.linalg.norm(pos, axis=1, keepdims=True)
+        v = dirs * v_r[:, None]
+    else:
+        v_t = vc * orbit * (1 - 0.3 * along) - side * 30.0
+        v = v_r[:, None] * ur + v_t[:, None] * ut + rng.normal(0, 6, (N, 2))
+        if burst is not None:
+            # 原地解体：恒星本来是静止的，剥下来的气体也几乎静止，只从中心往外轻轻散一点（方向带点乱），
+            # 很快被阻力刹住，在星体周围成一团；之后交给引力和漩涡（SHARD_SIM_VS 的 u_orbit / u_swirl）
+            a = th + rng.normal(0, 0.5, N)
+            sp = rng.uniform(*burst, N) * (0.4 + 0.6 * rad)
+            v = np.stack([np.cos(a), np.sin(a)], 1) * sp[:, None] + rng.normal(0, 3, (N, 2))
     init = np.zeros((N, 8), 'f4')
     init[:, 0], init[:, 1], init[:, 2] = x0 + off[:, 0], y0 + off[:, 1], z0
     init[:, 3], init[:, 4] = v[:, 0], v[:, 1]
-    init[:, 6], init[:, 7] = -1, np.where(kind == GAS, 0.1, 0.2)                # 气体没有“迸开”的那一下，阻力很小
+    # 阻力倍数：撕开的气体没有“迸开”的那一下，阻力很小；原地解体往外迸的要很快刹住（像胶囊碎掉的晶尘）
+    init[:, 6], init[:, 7] = -1, (np.where(kind == GAS, 0.1, 0.2) if burst is None else 0.9)
     c = np.array([color.redF(), color.greenF(), color.blueF()])
     w = rng.uniform(0, 0.25, (N, 1))
     look = np.zeros((N, 16), 'f4')
@@ -74,7 +91,9 @@ def debris(rng, color, x0, y0, z0, R, long_=1.0, thin=1.0, tear_s=0.0, extras=Tr
                            rng.uniform(0.5, 1.3, N))
     look[:, 8:11] = c * (1 - w) + w
     look[:, 11] = rng.random(N)
-    look[:, 12] = (along + 1) / 2 * tear_s                                    # 什么时候被撕到（朝黑洞的一侧先）
+    # 什么时候从星体上剥下来：星体从外圈往里一层层蒸发（STAR_FS 里同样的顺序），外圈的先走，
+    # 这样每颗粒子都是从星体刚消失的那一处出发的，不是凭空出现
+    look[:, 12] = np.clip((1 - rad) * 0.9 + rng.uniform(-0.05, 0.08, N), 0, 1) * tear_s
     look[kind == CLOUD, 12] = tear_s * 0.3                                    # 气云在撕到一半时冒出来
     look[:, 13], look[:, 15] = 1.0, 3.0                                       # 亮点的亮度、慢慢变暗的快慢
     return init, look
@@ -88,7 +107,7 @@ class Burst:
         self.tex, self.inst, self.vao = tex, inst, vao
         self.n = len(start)
         # 每片碎片消失（掉进视界或淡掉）的时间；倒着放时是它汇到恒星上的时间
-        life = np.minimum(steps, 4.4 * SIM_HZ) if forward else steps
+        life = np.minimum(steps, FADE_AT * SIM_HZ) if forward else steps
         self.gone = start + life / SIM_HZ
         self.weight = WEIGHT[kind]
         self.end = t0 + float(self.gone.max()) + 0.05
@@ -103,9 +122,9 @@ class SimJob:
     最后一遍提交后的下一帧再取结果（finish），那时显卡早算完了，不用等。"""
     PASSES_PER_FRAME = 20
 
-    def __init__(self, system, init):
+    def __init__(self, system, init, g=SHARD_G, orbit=0.0, swirl=0.0):
         ctx, N = system.ctx, len(init)
-        self.system, self.ctx, self.N = system, ctx, N
+        self.system, self.ctx, self.N, self.g, self.orbit, self.swirl = system, ctx, N, g, orbit, swirl
         st = np.zeros((N, STRIDE // 4), 'f4'); st[:, :8] = init
         self.bufs = [ctx.buffer(st.tobytes()), ctx.buffer(reserve=N * STRIDE)]
         self.vaos = [ctx.vertex_array(system.sim, [(b, '4f 4f 128x', 'in_a', 'in_b')]) for b in self.bufs]
@@ -120,7 +139,8 @@ class SimJob:
     def pump(self):
         """再提交几遍。"""
         sim, N = self.system.sim, self.N
-        for k, v in dict(u_dt=1 / SIM_HZ, u_G=SHARD_G, u_RS=self.system.rs, u_KT=SHARD_KT, u_KR=SHARD_KR).items():
+        for k, v in dict(u_dt=1 / SIM_HZ, u_G=self.g, u_RS=self.system.rs, u_KT=SHARD_KT, u_KR=SHARD_KR, u_orbit=self.orbit,
+                         u_swirl=self.swirl).items():
             sim[k].value = v
         for p in range(self.p, min(self.passes, self.p + self.PASSES_PER_FRAME)):
             sim['u_pass'].value = p
@@ -149,9 +169,9 @@ class ShardSystem:
         self.quad = ctx.buffer(np.array([-1, -1, 1, -1, -1, 1, 1, 1], 'f4').tobytes())
         self.bursts = []
 
-    def simulate(self, init):
-        """开始在显卡上把这批碎片往前模拟 SIM_STEPS 步（分几帧提交，见 SimJob）。"""
-        return SimJob(self, init)
+    def simulate(self, init, g=SHARD_G, orbit=0.0, swirl=0.0):
+        """开始在显卡上把这批碎片往前模拟 SIM_STEPS 步（分几帧提交，见 SimJob）。orbit、swirl：漩涡，见 SHARD_SIM_VS。"""
+        return SimJob(self, init, g, orbit, swirl)
 
     def add(self, t0, forward, tex, look, start, steps, streaks=True):
         """记下一批要画的碎片。start：每片开始的时间（相对 t0）；steps：路线有几步（正放时到掉进视界为止）；
