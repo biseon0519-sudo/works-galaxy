@@ -18,9 +18,16 @@ SHARD_KT, SHARD_KR = 0.7, 0.0         # 横向、径向的阻力（靠近黑洞�
 SHARD_CARRY = 120.0       # 恒星被撕开时本身正被吸过去的速度
 ORBIT = 0.55              # 恒星绕黑洞走的速度（圆轨道速度的几成），顺着吸积盘转的方向
 TIDAL = 90.0              # 潮汐：撕开那一刻，近的一侧已经比远的一侧走得快（拉长）、两侧往中间挤
-GAS, SPARK = 1, 0
-PER_STAR = (700, 120)     # 每颗恒星化成多少团气体、多少个亮点
-WEIGHT = np.array([0.3, 1.0], 'f4')           # 算“吞了多少”、黑洞被照亮多少时，亮点分量轻
+SPARK, GAS, CLOUD = 0, 1, 2
+PER_STAR = (700, 120, 5)              # 每颗恒星化成多少团气体、亮点，撕开的地方留下几团残留气云
+CLOUD_S = 2.4             # 残留气云持续多久（秒）：它留在原地，不按模拟的路线走
+WEIGHT = np.array([0.3, 1.0, 0.0], 'f4')          # 算“吞了多少”、黑洞被照亮多少时，亮点分量轻，气云不算
+
+
+def life_steps(look, done):
+    """每个粒子要画几步：气体、亮点画到掉进视界（没掉进去就到模拟结束），气云按固定时长。"""
+    steps = np.where(done >= 0, done, SIM_STEPS - 1)
+    return np.where(look[:, 6] == CLOUD, int(CLOUD_S * SIM_HZ), steps)
 
 
 def tidal(r):
@@ -29,19 +36,23 @@ def tidal(r):
     return t * t * (3 - 2 * t)
 
 
-def debris(rng, color, x0, y0, z0, R, long_=1.0, thin=1.0, tear_s=0.0):
+def debris(rng, color, x0, y0, z0, R, long_=1.0, thin=1.0, tear_s=0.0, extras=True):
     """一颗半径 R 的恒星在世界坐标 (x0, y0, z0) 被撕开时化成的气体。离黑洞越近，拉得越长。
     long_、thin：撕开那一刻星体已经顺着黑洞方向被拉长、两侧被挤扁的比例，气体就铺在同样的椭圆里，接得上。
     tear_s：星体从朝黑洞的一侧到背面被撕完要多久，每团气体等撕到它那里才出现。
+    extras：要不要残留气云。
     返回 (模拟的初始状态 (N, 8)，画用的参数 (N, 16))；画用参数里的编号、开始时间、步数之后再填。"""
     r0 = math.hypot(x0, y0) or 1.0
     ur = np.array([x0 / r0, y0 / r0])           # 从黑洞指向恒星
     ut = np.array([y0 / r0, -x0 / r0])          # 绕黑洞走的方向（和吸积盘在屏幕上的转向一致）
     td = tidal(r0)
-    ng, ns = PER_STAR
-    N = ng + ns
-    kind = np.repeat([GAS, SPARK], [ng, ns])
+    ng, ns, nc = PER_STAR
+    if not extras:
+        nc = 0
+    N = ng + ns + nc
+    kind = np.repeat([GAS, SPARK, CLOUD], [ng, ns, nc])
     rad, th = np.sqrt(rng.random(N)), rng.uniform(0, 6.2832, N)               # 铺满整个（被拉长的）恒星
+    rad[kind == CLOUD] *= 0.5                                                 # 气云挤在中间
     along, side = rad * np.cos(th), rad * np.sin(th)                          # 沿着 / 垂直于“黑洞—恒星”方向的位置（-1~1）
     off = (along * R * long_)[:, None] * ur + (side * R * thin)[:, None] * ut
     vc = math.sqrt(SHARD_G / r0)
@@ -59,10 +70,12 @@ def debris(rng, color, x0, y0, z0, R, long_=1.0, thin=1.0, tear_s=0.0):
     look = np.zeros((N, 16), 'f4')
     look[:, 0:3] = init[:, 0:3]
     look[:, 6] = kind
-    look[:, 7] = np.where(kind == GAS, R * rng.uniform(0.18, 0.38, N), rng.uniform(0.5, 1.3, N))
+    look[:, 7] = np.select([kind == GAS, kind == CLOUD], [R * rng.uniform(0.18, 0.38, N), R * rng.uniform(0.6, 0.9, N)],
+                           rng.uniform(0.5, 1.3, N))
     look[:, 8:11] = c * (1 - w) + w
     look[:, 11] = rng.random(N)
     look[:, 12] = (along + 1) / 2 * tear_s                                    # 什么时候被撕到（朝黑洞的一侧先）
+    look[kind == CLOUD, 12] = tear_s * 0.3                                    # 气云在撕到一半时冒出来
     look[:, 13], look[:, 15] = 1.0, 3.0                                       # 亮点的亮度、慢慢变暗的快慢
     return init, look
 
@@ -70,8 +83,8 @@ def debris(rng, color, x0, y0, z0, R, long_=1.0, thin=1.0, tear_s=0.0):
 class Burst:
     """一批碎片（一次收起或一次展开）：显存里的路线纹理 + 每片的参数；时间都相对 t0。"""
 
-    def __init__(self, t0, forward, tex, inst, vao, start, steps, kind):
-        self.t0, self.forward = t0, forward
+    def __init__(self, t0, forward, tex, inst, vao, start, steps, kind, streaks):
+        self.t0, self.forward, self.streaks = t0, forward, streaks
         self.tex, self.inst, self.vao = tex, inst, vao
         self.n = len(start)
         # 每片碎片消失（掉进视界或淡掉）的时间；倒着放时是它汇到恒星上的时间
@@ -140,14 +153,15 @@ class ShardSystem:
         """开始在显卡上把这批碎片往前模拟 SIM_STEPS 步（分几帧提交，见 SimJob）。"""
         return SimJob(self, init)
 
-    def add(self, t0, forward, tex, look, start, steps):
-        """记下一批要画的碎片。start：每片开始的时间（相对 t0）；steps：路线有几步（正放时到掉进视界为止）。"""
+    def add(self, t0, forward, tex, look, start, steps, streaks=True):
+        """记下一批要画的碎片。start：每片开始的时间（相对 t0）；steps：路线有几步（正放时到掉进视界为止）；
+        streaks：要不要速度拖尾。"""
         look = look.copy()
         look[:, 3] = np.arange(len(look))
         look[:, 4], look[:, 5] = start, steps
         inst = self.ctx.buffer(look.astype('f4').tobytes())
         vao = self.ctx.vertex_array(self.prog, [(self.quad, '2f', 'in_corner'), (inst, '4f 4f 4f 4f/i', 'i_a', 'i_b', 'i_c', 'i_d')])
-        b = Burst(t0, forward, tex, inst, vao, start, steps, look[:, 6].astype(int))
+        b = Burst(t0, forward, tex, inst, vao, start, steps, look[:, 6].astype(int), streaks)
         self.bursts.append(b)
         return b
 
@@ -179,7 +193,7 @@ class ShardSystem:
             b.tex.use(0)
             for k, v in dict(u_vp=(vw, vh), u_cam=(cam_c.x(), cam_c.y(), cam_s), u_bh=bh, u_t=now - b.t0,
                              u_dir=1.0 if b.forward else -1.0, u_hz=float(SIM_HZ), u_rs=float(self.rs), u_focal=float(self.focal),
-                             u_n=b.n, u_w=TEX_W, u_rec=0, u_time=now).items():
+                             u_n=b.n, u_w=TEX_W, u_rec=0, u_time=now, u_streak=1.0 if b.streaks else 0.0).items():
                 m = prog.get(k, None)
                 if m is not None:
                     m.value = v

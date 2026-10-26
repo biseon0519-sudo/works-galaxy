@@ -639,24 +639,30 @@ SHARD_VS = '''
 uniform vec2 u_vp;
 uniform vec3 u_cam;       // 镜头看向的世界坐标 x、y，缩放
 uniform vec3 u_bh;        // 黑洞在屏幕上的位置和阴影半径
-uniform float u_t;        // 这批碎片开始后过了多久（秒）
+uniform float u_t;        // 这批开始后过了多久（秒）
 uniform float u_dir;      // 1 = 正着放（收起），-1 = 倒着放（展开）
 uniform float u_hz, u_rs, u_focal;
-uniform int u_n, u_w;     // 碎片数，路线纹理的宽度
+uniform int u_n, u_w;     // 粒子数，路线纹理的宽度
 uniform sampler2D u_rec;
+uniform float u_streak;   // 1 = 速度拖尾
 in vec2 in_corner;
 in vec4 i_a;              // 起点 x、y、z，编号
-in vec4 i_b;              // 开始时间，路线有几步，种类（0 亮点 / 1 气体），大小
+in vec4 i_b;              // 开始时间，路线有几步，种类（0 亮点 / 1 气体 / 2 残留气云），大小
 in vec4 i_c;              // 颜色 r、g、b，随机数
 in vec4 i_d;              // 被撕到的时刻（秒），亮点的亮度，（没用），亮点变暗的快慢（秒）
 out vec2 v_local;
 flat out vec4 v_col;      // 颜色、透明度
-flat out vec4 v_par;      // 亮点的亮度 / 气体离黑洞多近，随机数，被撕下来多久（秒），种类
+flat out vec4 v_par;      // 亮点的亮度 / 离黑洞多近，随机数，被撕下来多久（秒），种类
 vec3 at(int k){
     if (k <= 0) return i_a.xyz;
     int j = k - 1, pass = j / 8;
     int L = pass * u_n * 10 + int(i_a.w) * 10 + 2 + (j - pass * 8);
     return texelFetch(u_rec, ivec2(L % u_w, L / u_w), 0).xyz;
+}
+vec2 screen(vec3 p, out float kk){
+    float close = clamp((u_rs * 4.0 - length(p.xy)) / (u_rs * 2.5), 0.0, 1.0);    // 越靠近黑洞越贴近盘面
+    kk = u_cam.z * u_focal / (u_focal - p.z);
+    return (vec2(p.x, p.y * (1.0 - 0.45 * close * close)) - u_cam.xy) * kk + u_vp * 0.5;
 }
 void main(){
     float n = i_b.y;
@@ -664,31 +670,42 @@ void main(){
     if (k < 0.0 || k > n - 1.0){
         gl_Position = vec4(-9.0, -9.0, 0.0, 1.0); v_col = vec4(0.0); v_par = vec4(0.0); v_local = vec2(0.0); return;
     }
+    float kind = i_b.z, age = k / u_hz, born = age - i_d.x;
     int k0 = int(floor(k));
-    vec3 p = mix(at(k0), at(k0 + 1), k - float(k0));
-    float age = k / u_hz;
-    float r = length(p.xy);
-    float close = clamp((u_rs * 4.0 - r) / (u_rs * 2.5), 0.0, 1.0);
-    float kk = u_cam.z * u_focal / (u_focal - p.z);
-    vec2 s = (vec2(p.x, p.y * (1.0 - 0.45 * close * close)) - u_cam.xy) * kk + u_vp * 0.5;
+    vec3 p = kind < 1.5 ? mix(at(k0), at(k0 + 1), k - float(k0))
+                        : i_a.xyz + vec3(normalize(i_a.xy) * 10.0 * age, 0.0);     // 残留气云留在撕开的地方，慢慢往外飘
+    float kk;
+    vec2 s = screen(p, kk);
     float a = clamp((length(s - u_bh.xy) - u_bh.z * 0.85) / (u_bh.z * 0.5), 0.0, 1.0);
-    if (u_dir > 0.0) a *= clamp((4.4 - age) / 0.6, 0.0, 1.0);      // 没掉进去的慢慢淡掉
-    a *= smoothstep(i_d.x, i_d.x + 0.1, age); // 星体被撕到这里时才出现（朝黑洞的一侧先）；展开时倒过来，气体在这里补回星体时淡掉
-    float kind = i_b.z;
-    float ext;
-    if (kind < 0.5){                          // 亮点：和晶尘一样的菱形光点
-        float sz = max(0.6, i_b.w * min(1.6, kk));
-        ext = sz * 5.0;
-        v_local = in_corner * 5.0;
-    } else {                                  // 气体：按世界大小的一团柔光
-        ext = max(1.5, i_b.w * kk) * 2.0;
+    if (u_dir > 0.0 && kind < 1.5) a *= clamp((4.4 - age) / 0.6, 0.0, 1.0);      // 没掉进去的慢慢淡掉
+    a *= smoothstep(0.0, 0.1, born);          // 星体被撕到这里时才出现（朝黑洞的一侧先）；展开时倒过来
+    vec2 ax = vec2(1.0, 0.0), ay = vec2(0.0, 1.0);
+    float ext, stretch = 1.0;
+    if (kind < 1.5){
+        // 速度拖尾：顺着屏幕上的运动方向拉长，越快越长；光摊开了就暗一点
+        float k2;
+        vec2 vs = (screen(at(k0 + 1), k2) - screen(at(k0), k2)) * u_hz;
+        float sp = length(vs);
+        if (sp > 1.0){ ax = vs / sp; ay = vec2(-ax.y, ax.x); }
+        stretch = 1.0 + min(sp * 0.012, 3.0) * u_streak;
+        a /= pow(stretch, 0.8);               // 光摊开在更长的一条上，总亮度不变多少
+        if (kind < 0.5){                      // 亮点：和晶尘一样的菱形光点
+            ext = max(0.6, i_b.w * min(1.6, kk)) * 5.0;
+            v_local = in_corner * 5.0;
+        } else {                              // 气体：按世界大小的一团柔光
+            ext = max(1.5, i_b.w * kk) * 2.0;
+            v_local = in_corner * 2.0;
+        }
+    } else {                                  // 残留气云：撕开的地方一大团淡淡的光，慢慢胀大、淡掉
+        ext = i_b.w * kk * (1.0 + 0.3 * age) * 2.0;
         v_local = in_corner * 2.0;
+        a *= smoothstep(0.0, 0.3, born) * (1.0 - smoothstep(0.6, 2.4, age));
     }
-    vec2 px = s + in_corner * ext;
+    vec2 px = s + (ax * in_corner.x * stretch + ay * in_corner.y) * ext;
     gl_Position = vec4(px.x / u_vp.x * 2.0 - 1.0, 1.0 - px.y / u_vp.y * 2.0, 0.0, 1.0);
-    float near = smoothstep(u_rs * 7.0, u_rs * 1.5, r);       // 越靠近黑洞越热、越亮
+    float near = smoothstep(u_rs * 7.0, u_rs * 1.5, length(p.xy));    // 越靠近黑洞越热、越亮
     v_col = vec4(i_c.rgb, a);
-    v_par = vec4(kind < 0.5 ? i_d.y * exp(-age / i_d.w) : near, i_c.w, age - i_d.x, kind);
+    v_par = vec4(kind < 0.5 ? i_d.y * exp(-age / i_d.w) : near, i_c.w, born, kind);
 }
 '''
 
@@ -697,6 +714,7 @@ SHARD_FS = '''
 uniform float u_time;
 in vec2 v_local; flat in vec4 v_col; flat in vec4 v_par;
 out vec4 f;
+''' + NOISE + '''
 void main(){
     float heat = v_par.x, seed = v_par.y, born = v_par.z, kind = v_par.w;
     float op = v_col.a;
@@ -704,7 +722,8 @@ void main(){
     // 带上恒星本来的颜色（淡色恒星先提饱和度，不然白的、淡蓝的恒星化开是一团白）
     vec3 cs = clamp(mix(vec3(dot(v_col.rgb, vec3(0.3, 0.59, 0.11))), v_col.rgb, 2.2), 0.0, 1.0);
     vec2 q = v_local;
-    float win = 1.0 - smoothstep(0.8, 1.0, max(abs(q.x), abs(q.y)) / (kind < 0.5 ? 5.0 : 2.0));
+    float edge = kind < 0.5 ? 5.0 : 2.0;
+    float win = 1.0 - smoothstep(0.8, 1.0, max(abs(q.x), abs(q.y)) / edge);
     vec3 col;
     if (kind < 0.5){
         // 亮点：菱形光点 + 十字闪光，会闪，慢慢变暗；加色（透明度 0）
@@ -713,11 +732,15 @@ void main(){
         float tw = 0.55 + 0.45 * sin(u_time * 9.0 + seed * 40.0);
         float spark = (exp(-abs(q.x) * 6.0) * exp(-abs(q.y) * 1.2) + exp(-abs(q.y) * 6.0) * exp(-abs(q.x) * 1.2)) * 0.35 * tw;
         col = (mix(vec3(1.0), cs * 1.3, 0.5) * (core * 1.1 + spark) + vec3(core * 0.2 * tw)) * heat;
-    } else {
+    } else if (kind < 1.5){
         // 气体：一团薄薄的发光等离子体（和物质流同一种画法），叠在一起就是恒星化开的那一大片；
         // 颜色从恒星本色慢慢变成吸积盘的暖色，越靠近黑洞越亮
         col = mix(cs * 1.2, vec3(1.0, 0.72, 0.42), heat) * (1.0 + 1.5 * heat) * exp(-dot(q, q) * 1.6) * 0.022;
         col *= 1.0 + 1.6 * (1.0 - smoothstep(0.0, 0.6, born));   // 刚从星体上撕下来时和星体表面差不多亮，0.6 秒内暗下来
+    } else {
+        // 残留气云：边缘不规则的一团淡光，恒星本色偏暖
+        float cloud = 0.55 + 0.9 * fbm(q * 1.3 + seed * 17.0 + u_time * 0.05);
+        col = mix(cs, vec3(1.0, 0.6, 0.35), 0.35) * exp(-dot(q, q) * 1.4) * cloud * 0.04;
     }
     f = vec4(col * op * win, 0.0);
 }

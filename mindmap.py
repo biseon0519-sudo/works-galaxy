@@ -11,7 +11,7 @@ from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from qfluentwidgets import RoundMenu, Action, FluentIcon as FIF
 from widgets import CoverPopup, font, DIGITS
 from shaders import QUAD_VS, SKY_FS, SPRITE_VS, HOLE_FS, STAR_FS, PILL_FS, BEAM_VS, BEAM_FS, DUST_FS, LABEL_FS, DOWN_FS
-from shards import ShardSystem, debris, SIM_HZ, SIM_STEPS, SHARD_CARRY, SHARD_G, ORBIT
+from shards import ShardSystem, debris, life_steps, SIM_HZ, SHARD_CARRY, SHARD_G, ORBIT
 from stream import StreamSystem, MAX_STARS
 
 if sys.platform == 'win32':        # Windows 默认定时器精度 15.6 毫秒，掐帧时间要 1 毫秒精度
@@ -45,6 +45,8 @@ ATTRACT_S = 0.55          # 被吸过去的时长（之后碎开）
 ATTRACT_D = 0.35          # 碎开前已经被吸过去的距离比例
 DISSOLVE_S = 0.3          # 撕开时星体淡掉、气体淡入的交叉时间
 SWALLOW_S = ATTRACT_S + 0.3 + DISSOLVE_S + 0.05       # 恒星本体的动画时长（每颗撕开的时间错开 0~0.3 秒）
+# 撕开时的速度拖尾、残留气云只加在收起上（用户觉得展开现在刚好）；改成 True 展开也加（倒着放）
+REBIRTH_FX = False
 STAR_TORN = (1.15, 1.55, 0.85)        # 撕开那一刻星体看起来的大小（几倍 STAR_R）、被拉长、被挤扁的比例（和 STAR_FS 里一致）
 # 展开 = 收起倒着放：先在新位置按收起的过程正着模拟一遍（碎开 → 引力落进黑洞），记下每片碎片的路线再倒着播放——
 # 碎片从黑洞里冲出来、越飞越慢、越来越热，在恒星那里同时收拢，恒星带着裂缝凝结出来、裂缝愈合，再慢慢退回自己的位置
@@ -555,7 +557,8 @@ class MindMap(QOpenGLWidget):
                 ts = 0.0
                 x0, y0, z = n.base.x() * (1 - ATTRACT_D), n.base.y() * (1 - ATTRACT_D), n.z * (1 - ATTRACT_D)
             size, long_, thin = STAR_TORN
-            a, b = debris(rng, n.color, x0, y0, z, STAR_R * size, long_, thin, DISSOLVE_S)
+            fx = job['kind'] == 'collapse' or REBIRTH_FX
+            a, b = debris(rng, n.color, x0, y0, z, STAR_R * size, long_, thin, DISSOLVE_S, extras=fx)
             init.append(a); look.append(b); owner.append(np.full(len(a), i)); at.append(np.full(len(a), ts))
         job['look'], job['owner'], job['at'] = map(np.concatenate, (look, owner, at))
         job['rng'] = rng
@@ -563,10 +566,10 @@ class MindMap(QOpenGLWidget):
 
     def _finish_sim(self, job):
         tex, done = job['sim'].finish()
-        steps = np.where(done >= 0, done, SIM_STEPS - 1)
+        steps = life_steps(job['look'], done)
         t0, look = job['t0'], job['look']
         if job['kind'] == 'collapse':
-            b = self.parts.add(t0, True, tex, look, job['at'], steps)
+            b = self.parts.add(t0, True, tex, look, job['at'], steps, streaks=True)
             # 差不多都吞进去（按分量剩 12%）的那一刻：黑洞亮一下，荡开一圈涟漪
             order = np.argsort(b.gone)
             w = np.cumsum(b.weight[order])
@@ -578,7 +581,7 @@ class MindMap(QOpenGLWidget):
             birth = lead + job['rng'].uniform(0.0, 0.3, len(nodes))
             for n, bt in zip(nodes, birth):
                 n.birth_at = bt
-            self.parts.add(t0, False, tex, look, birth[job['owner']] - steps / SIM_HZ, steps)
+            self.parts.add(t0, False, tex, look, birth[job['owner']] - steps / SIM_HZ, steps, streaks=REBIRTH_FX)
             self.anim.dur = lead + 0.3 + ATTRACT_S + 0.1
             self._gulp_t = t0                           # 黑洞先亮一下、荡开涟漪，碎片接着冲出来
 
