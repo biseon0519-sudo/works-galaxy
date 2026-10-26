@@ -1,12 +1,12 @@
 # 年度作品：按年份记录每年喜欢的作品（音乐、小说、综艺……），放射状思维导图显示；可以从 MarginNote 导出的导图导入
 import os, sys, threading, datetime, traceback
-from PySide6.QtGui import QColor, QIcon, QFontDatabase, QGuiApplication, QCursor
+from PySide6.QtGui import QIcon, QFontDatabase, QGuiApplication, QCursor
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QWidget, QFileDialog
 if __name__ == '__main__' and QApplication.instance() is None:
     # 启动提速（同抽卡统计）：先建好 QApplication，让后台线程去扫系统字体，和下面导入界面库同时进行
     _app = QApplication(sys.argv)
     threading.Thread(target=QFontDatabase.families, daemon=True).start()
-from qfluentwidgets import (CaptionLabel, PushButton, InfoBar, InfoBarPosition, MessageBoxBase, SubtitleLabel, SpinBox,
+from qfluentwidgets import (PushButton, InfoBar, InfoBarPosition, MessageBoxBase, SubtitleLabel, SpinBox,
                             MessageBox, ToolTipFilter, ToolTipPosition, FluentIcon as FIF, setTheme, setThemeColor, Theme)
 import store, marginnote
 from widgets import EditDialog
@@ -52,7 +52,7 @@ class App(Window):
         self.map.deleteYear.connect(self.delete_year)
         self.map.layoutChanged.connect(lambda: store.save(self.doc))     # 拖过恒星：位置存进 data/作品.json
 
-        # 浮在导图上的按钮和提示
+        # 浮在导图上的按钮
         self.tools = QWidget(self)
         h = QHBoxLayout(self.tools); h.setContentsMargins(0, 0, 0, 0); h.setSpacing(8)
         btn_import = PushButton(FIF.DOWNLOAD, '从 MarginNote 导入')
@@ -63,19 +63,15 @@ class App(Window):
         btn_year.clicked.connect(self.add_year)
         h.addWidget(btn_import); h.addWidget(btn_year)
         self.tools.adjustSize()
-        self.hint = CaptionLabel('点年份展开 · 点中心收起全部 · 点分类收起 · 滚轮缩放 · 拖动平移 · 双击空白处对准 · 右键更多', self)
-        self.hint.setTextColor(QColor(255, 255, 255, 110), QColor(255, 255, 255, 110))
-        self.hint.adjustSize()
         self.titleBar.raise_()
 
         self.map.set_doc(self.doc, expand=self.settings.get('year'), first=True)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        if not hasattr(self, 'hint'):        # 父类初始化时就会触发 resize，那时还没建好
+        if not hasattr(self, 'tools'):       # 父类初始化时就会触发 resize，那时还没建好
             return
         self.tools.move(self.width() - self.tools.width() - 16, self.titleBar.height() + 8)
-        self.hint.move(18, self.height() - self.hint.height() - 12)
 
     def showEvent(self, e):
         super().showEvent(e)
