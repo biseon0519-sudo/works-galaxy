@@ -1,8 +1,10 @@
-# 评分星星、封面框、编辑对话框（导图里点作品弹出来的）
+# 评分星星、封面框、编辑对话框（导图里点作品弹出来的）、鼠标停在作品上时的悬停卡片
 import os, math
-from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QSize
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPixmap, QImage, QFont, QPolygonF, QPen, QKeySequence
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QApplication, QFileDialog, QSizePolicy
+import numpy as np
+from PySide6.QtCore import Qt, Signal, QRectF, QPointF
+from PySide6.QtGui import (QColor, QPainter, QPainterPath, QPixmap, QImage, QImageReader, QFont, QFontMetricsF, QPolygonF,
+                           QPen, QKeySequence, QLinearGradient, QGuiApplication)
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QApplication, QFileDialog
 from qfluentwidgets import (MessageBoxBase, SubtitleLabel, LineEdit, ComboBox, PlainTextEdit, BodyLabel, CaptionLabel,
                             PushButton, TransparentToolButton, ToolTipFilter, ToolTipPosition, MessageBox,
                             FluentIcon as FIF, isDarkTheme, themeColor)
@@ -10,6 +12,12 @@ import store
 
 STAR_GOLD = QColor('#e3a21a')
 IMAGE_FILTER = '图片 (*.png *.jpg *.jpeg *.webp *.bmp *.gif)'
+FONT, DIGITS = 'Microsoft YaHei UI', 'Bahnschrift'      # 数字用 Bahnschrift（Windows 自带的窄体），更有科技感
+
+
+def font(px, bold=False, family=FONT):
+    f = QFont(family); f.setPixelSize(px); f.setBold(bold)
+    return f
 
 
 def text_color(alpha=255):
@@ -303,3 +311,120 @@ class EditDialog(MessageBoxBase):
         if box.exec():
             self.deleted = True
             self.reject()
+
+
+# ---------- 悬停卡片（导图是显卡画的，卡片是普通窗口，辉光在 CPU 上算一次缓存） ----------
+_glow = {}
+
+
+def _blur(a, sigma):
+    """可分离的高斯模糊（先横后竖）。"""
+    r = max(1, int(sigma * 3))
+    x = np.arange(-r, r + 1)
+    k = np.exp(-x * x / (2 * sigma * sigma)); k /= k.sum()
+    a = np.lib.stride_tricks.sliding_window_view(np.pad(a, ((0, 0), (r, r))), 2 * r + 1, axis=1) @ k
+    return np.lib.stride_tricks.sliding_window_view(np.pad(a, ((r, r), (0, 0))), 2 * r + 1, axis=0) @ k
+
+
+def glow_margin(sigma):
+    return int(math.ceil(sigma * 3)) + 2
+
+
+def glow_pixmap(w, h, radius, color, sigma):
+    """圆角矩形外的柔光（高斯模糊）。返回 (图, 外边距)。"""
+    key = (round(w), round(h), round(radius), color.rgb(), sigma)
+    hit = _glow.get(key)
+    if hit is None:
+        m = glow_margin(sigma)
+        W, H = int(w) + 2 * m, int(h) + 2 * m
+        mask = QImage(W, H, QImage.Format_Grayscale8); mask.fill(0)
+        p = QPainter(mask); p.setRenderHint(QPainter.Antialiasing); p.setPen(Qt.NoPen); p.setBrush(QColor(255, 255, 255))
+        p.drawRoundedRect(QRectF(m, m, w, h), radius, radius); p.end()
+        a = np.frombuffer(mask.constBits(), np.uint8).reshape(H, mask.bytesPerLine())[:, :W] / 255.0
+        alpha = np.clip(_blur(a, sigma * 0.33) * 0.55 + _blur(a, sigma) * 0.62, 0, 1)
+        rgb = np.array([color.blue(), color.green(), color.red()], float)
+        out = np.empty((H, W, 4), np.uint8)
+        out[..., :3] = (rgb * alpha[..., None]).astype(np.uint8)
+        out[..., 3] = (alpha * 255).astype(np.uint8)
+        hit = (QPixmap.fromImage(QImage(out.tobytes(), W, H, W * 4, QImage.Format_ARGB32_Premultiplied).copy()), m)
+        _glow[key] = hit
+    return hit
+
+
+class CoverPopup(QWidget):
+    """鼠标停在作品上时弹出的小卡片：封面（没有就画个占位）+ 名字、作者、评分、短评。"""
+    W, PAD, SIGMA = 236, 12, 6
+    M = glow_margin(SIGMA)
+
+    def __init__(self):
+        super().__init__(None, Qt.ToolTip | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.work, self.color = None, QColor('white')
+
+    def show_for(self, work, color, gpos):
+        self.work, self.color = work, QColor(color)
+        iw = self.W - 2 * self.PAD
+        path = store.cover_path(work)
+        self.img_h = 0
+        if path:
+            sz = QImageReader(path).size()
+            if sz.width() > 0:
+                self.img_h = min(300, round(iw * sz.height() / sz.width()))
+        self.ph = 0 if self.img_h else 96
+        self.lines = []
+        y = self.PAD + (self.img_h or self.ph) + 10
+        for text, f, alpha in ((work['title'], font(14, True), 255), (work['author'], font(12), 170)):
+            if text:
+                h = QFontMetricsF(f).boundingRect(QRectF(0, 0, iw, 400), Qt.TextWordWrap, text).height()
+                self.lines.append((QRectF(self.PAD, y, iw, h), text, f, alpha)); y += h + 2
+        self.star_y = None
+        if work['rating']:
+            self.star_y = y + 9; y += 20
+        if work['comment']:
+            f = font(12)
+            h = min(QFontMetricsF(f).boundingRect(QRectF(0, 0, iw, 400), Qt.TextWordWrap, work['comment']).height(), 72)
+            self.lines.append((QRectF(self.PAD, y + 4, iw, h), work['comment'], f, 200)); y += h + 6
+        self.ch = y + self.PAD
+        self.resize(self.W + 2 * self.M, int(self.ch) + 2 * self.M)
+        # 放在鼠标右边，放不下就放左边；上下不出屏幕
+        scr = (QGuiApplication.screenAt(gpos) or QGuiApplication.primaryScreen()).availableGeometry()
+        x = gpos.x() + 18
+        if x + self.width() > scr.right():
+            x = gpos.x() - 18 - self.width()
+        y = max(scr.top(), min(gpos.y() - 40, scr.bottom() - self.height()))
+        self.move(x, y)
+        self.show(); self.update()
+
+    def paintEvent(self, e):
+        if not self.work:
+            return
+        p = QPainter(self)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing | QPainter.SmoothPixmapTransform)
+        m = self.M
+        card = QRectF(m, m, self.W, self.ch)
+        p.drawPixmap(QPointF(0, 0), glow_pixmap(card.width(), card.height(), 14, self.color, self.SIGMA)[0])
+        p.setPen(QPen(self.color, 1.2)); p.setBrush(QColor(9, 13, 30, 245))
+        p.drawRoundedRect(card, 14, 14)
+        p.translate(m, m)
+        iw = self.W - 2 * self.PAD
+        box = QRectF(self.PAD, self.PAD, iw, self.img_h or self.ph)
+        clip = QPainterPath(); clip.addRoundedRect(box, 9, 9)
+        if self.img_h:
+            pm = cover_pixmap(store.cover_path(self.work), round(iw), self.img_h, self.devicePixelRatioF())
+            if pm:
+                p.save(); p.setClipPath(clip); p.drawPixmap(box.topLeft(), pm); p.restore()
+        else:
+            g = QLinearGradient(box.topLeft(), box.bottomRight())
+            c1, c2 = QColor(self.color), QColor(self.color)
+            c1.setAlpha(70); c2.setAlpha(18)
+            g.setColorAt(0, c1); g.setColorAt(1, c2)
+            p.setPen(Qt.NoPen); p.setBrush(g); p.drawPath(clip)
+            p.setPen(QColor(255, 255, 255, 120)); p.setFont(font(12))
+            p.drawText(box, Qt.AlignCenter, '还没有封面\n点一下作品可以添加')
+        for rect, text, f, alpha in self.lines:
+            p.setFont(f); p.setPen(QColor(255, 255, 255, alpha))
+            p.drawText(rect, Qt.TextWordWrap, text)
+        if self.star_y is not None:
+            draw_stars(p, self.PAD, self.star_y, 13, 3.2, self.work['rating'], QColor(255, 255, 255, 40))

@@ -1,5 +1,5 @@
 # Win11 风格（从 C:\CosyVoiceLocal\fluent_ui.py 复制，和打字代说保持一致）：Mica 磨砂背景、跟随系统深浅色、用系统主题色
-import os, sys, winreg
+import sys, winreg
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import QApplication, QVBoxLayout
