@@ -72,11 +72,11 @@ def debris(rng, color, x0, y0, z0, R, long_=1.0, thin=1.0, tear_s=0.0, extras=Tr
         v_t = vc * orbit * (1 - 0.3 * along) - side * 30.0
         v = v_r[:, None] * ur + v_t[:, None] * ut + rng.normal(0, 6, (N, 2))
         if burst is not None:
-            # 原地解体：恒星本来是静止的，剥下来的气体也几乎静止，只从中心往外轻轻散一点（方向带点乱），
-            # 很快被阻力刹住，在星体周围成一团；之后交给引力和漩涡（SHARD_SIM_VS 的 u_orbit / u_swirl）
-            a = th + rng.normal(0, 0.5, N)
-            sp = rng.uniform(*burst, N) * (0.4 + 0.6 * rad)
-            v = np.stack([np.cos(a), np.sin(a)], 1) * sp[:, None] + rng.normal(0, 3, (N, 2))
+            # 原地解体：恒星本来是静止的，剥下来的气体也几乎静止，只朝随便哪个方向轻轻飘一点，很快被阻力刹住，
+            # 在原地成实心的一团（都往外散会堆成外亮内空的“甜甜圈”）；之后交给引力和漩涡（SHARD_SIM_VS 的 u_orbit / u_swirl）
+            a = rng.uniform(0, 6.2832, N)
+            sp = rng.uniform(*burst, N)
+            v = np.stack([np.cos(a), np.sin(a)], 1) * sp[:, None]
     init = np.zeros((N, 8), 'f4')
     init[:, 0], init[:, 1], init[:, 2] = x0 + off[:, 0], y0 + off[:, 1], z0
     init[:, 3], init[:, 4] = v[:, 0], v[:, 1]
@@ -91,9 +91,9 @@ def debris(rng, color, x0, y0, z0, R, long_=1.0, thin=1.0, tear_s=0.0, extras=Tr
                            rng.uniform(0.5, 1.3, N))
     look[:, 8:11] = c * (1 - w) + w
     look[:, 11] = rng.random(N)
-    # 什么时候从星体上剥下来：星体从外圈往里一层层蒸发（STAR_FS 里同样的顺序），外圈的先走，
-    # 这样每颗粒子都是从星体刚消失的那一处出发的，不是凭空出现
-    look[:, 12] = np.clip((1 - rad) * 0.9 + rng.uniform(-0.05, 0.08, N), 0, 1) * tear_s
+    # 什么时候从星体上剥下来：大体上外圈先走（STAR_FS 里星体也是从外往里、边缘不规则地蒸发），一半按层、一半随机，
+    # 这样粒子是从星体刚消失的地方出发的，又不会一层层分得太清楚、堆成“甜甜圈”
+    look[:, 12] = np.clip((1 - rad) * 0.6 + rng.uniform(0, 0.4, N), 0, 1) * tear_s
     look[kind == CLOUD, 12] = tear_s * 0.3                                    # 气云在撕到一半时冒出来
     look[:, 13], look[:, 15] = 1.0, 3.0                                       # 亮点的亮度、慢慢变暗的快慢
     return init, look
@@ -122,9 +122,9 @@ class SimJob:
     最后一遍提交后的下一帧再取结果（finish），那时显卡早算完了，不用等。"""
     PASSES_PER_FRAME = 20
 
-    def __init__(self, system, init, g=SHARD_G, orbit=0.0, swirl=0.0):
+    def __init__(self, system, init, g=SHARD_G, orbit=0.0, swirl=0.0, hold=0.0):
         ctx, N = system.ctx, len(init)
-        self.system, self.ctx, self.N, self.g, self.orbit, self.swirl = system, ctx, N, g, orbit, swirl
+        self.system, self.ctx, self.N, self.g, self.orbit, self.swirl, self.hold = system, ctx, N, g, orbit, swirl, hold
         st = np.zeros((N, STRIDE // 4), 'f4'); st[:, :8] = init
         self.bufs = [ctx.buffer(st.tobytes()), ctx.buffer(reserve=N * STRIDE)]
         self.vaos = [ctx.vertex_array(system.sim, [(b, '4f 4f 128x', 'in_a', 'in_b')]) for b in self.bufs]
@@ -140,7 +140,7 @@ class SimJob:
         """再提交几遍。"""
         sim, N = self.system.sim, self.N
         for k, v in dict(u_dt=1 / SIM_HZ, u_G=self.g, u_RS=self.system.rs, u_KT=SHARD_KT, u_KR=SHARD_KR, u_orbit=self.orbit,
-                         u_swirl=self.swirl).items():
+                         u_swirl=self.swirl, u_hold=self.hold).items():
             sim[k].value = v
         for p in range(self.p, min(self.passes, self.p + self.PASSES_PER_FRAME)):
             sim['u_pass'].value = p
@@ -169,9 +169,9 @@ class ShardSystem:
         self.quad = ctx.buffer(np.array([-1, -1, 1, -1, -1, 1, 1, 1], 'f4').tobytes())
         self.bursts = []
 
-    def simulate(self, init, g=SHARD_G, orbit=0.0, swirl=0.0):
-        """开始在显卡上把这批碎片往前模拟 SIM_STEPS 步（分几帧提交，见 SimJob）。orbit、swirl：漩涡，见 SHARD_SIM_VS。"""
-        return SimJob(self, init, g, orbit, swirl)
+    def simulate(self, init, g=SHARD_G, orbit=0.0, swirl=0.0, hold=0.0):
+        """开始在显卡上把这批碎片往前模拟 SIM_STEPS 步（分几帧提交，见 SimJob）。orbit、swirl、hold：见 SHARD_SIM_VS。"""
+        return SimJob(self, init, g, orbit, swirl, hold)
 
     def add(self, t0, forward, tex, look, start, steps, streaks=True):
         """记下一批要画的碎片。start：每片开始的时间（相对 t0）；steps：路线有几步（正放时到掉进视界为止）；

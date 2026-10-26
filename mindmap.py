@@ -44,13 +44,13 @@ ANIM_S, CAM_S = 1.1, 1.1  # 动画时长（秒）：普通移动、镜头（展�
 C_TEAR_S = 0.35           # 原地化开要多久
 C_G = SHARD_G * 0.3
 C_ORBIT, C_SWIRL = 0.8, 0.8           # 漩涡：被吸进去的路上，绕黑洞的速度慢慢（每秒约 0.8）被带到圆轨道速度的 0.8
-C_BURST = (8.0, 30.0)     # 化开时往外轻轻散开的速度（气体先在星体周围成一团，不飞走）
+C_BURST = (3.0, 15.0)     # 化开时朝各个方向轻轻飘开的速度（气体先在原地成实心的一团，不飞走）
 SWALLOW_S = 0.3 + C_TEAR_S + 0.05     # 恒星本体的动画时长（每颗解体的时间错开 0~0.3 秒）
 # 撕开时的速度拖尾、残留气云只加在收起上（用户觉得展开现在刚好）；改成 True 展开也加（倒着放）
 REBIRTH_FX = False
 # 展开 = 一遍“被吞掉”倒着放：先在恒星自己的位置正着模拟一遍（只沿直线掉进黑洞），记下每团气体的路线再倒着播放——
 # 气体从黑洞沿直线喷出、越飞越慢，在恒星那里汇成，恒星原地慢慢凝实（DISSOLVE_S），节奏用 BIRTH_TAIL_S 收尾
-DISSOLVE_S = 0.3          # 展开时气体汇成星体要多久
+DISSOLVE_S = 0.4          # 展开时气体汇成星体要多久（太快了恒星像是“弹”出来的）
 BIRTH_TAIL_S = 0.55       # 最后一颗恒星成形后，展开动画再留多久（原来的节奏）
 ROPE_LAG, ROPE_K, ROPE_D = 0.5, 22.0, 6.0     # 分支光丝的惯性：端点动时控制点只跟上一部分，再靠弹簧追上
 # 拖动恒星的手感和鼠标扰动的气泡一样：恒星像在水里，被弹簧带着跟光标走，慢半拍，松手后慢慢停稳
@@ -565,7 +565,8 @@ class MindMap(QOpenGLWidget):
         if job['kind'] == 'collapse':
             job['sim'] = self.parts.simulate(np.concatenate(init), C_G, C_ORBIT, C_SWIRL)
         else:
-            job['sim'] = self.parts.simulate(np.concatenate(init))
+            # 展开：气体剥下来后先停在原地 DISSOLVE_S 再往里掉，倒着放 = 气体先汇到、停住，恒星再从里面凝出来
+            job['sim'] = self.parts.simulate(np.concatenate(init), hold=DISSOLVE_S)
 
     def _finish_sim(self, job):
         tex, done = job['sim'].finish()

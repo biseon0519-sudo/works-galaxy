@@ -276,7 +276,8 @@ void main(){
         // 所以粒子是从星体上出来的，不是星体消失后凭空出现（展开时倒过来：粒子汇过来，星体从中心长出来）。
         // 以前试过一道撕口扫过去（像月食，有残影）、到处冒洞（像奶牛斑、裂成好几片）、整颗一起变淡（和粒子接不上），都不好
         float n = fbm(q * 3.0 + seed * 7.0);
-        float edge = 1.02 - tear * 1.1 + (n - 0.5) * 0.18;  // 还剩下的半径
+        // 还剩下的半径：刚开始蒸发时边缘很不规则（粒子出发也是半随机的），快没了时收成中间的一小团（展开时从中心长出来，不是从边上冒出来）
+        float edge = 1.02 - tear * 1.15 + (n - 0.5) * 0.4 * (1.0 - tear);
         keep = 1.0 - smoothstep(edge - 0.05, edge + 0.01, r);
         float de = (r - edge) / 0.05;
         rim = exp(-de * de) * body * (1.0 - smoothstep(0.75, 1.0, tear));
@@ -603,6 +604,7 @@ uniform int u_pass;
 uniform float u_G, u_RS, u_KT, u_KR;
 uniform float u_orbit;    // 漩涡：绕黑洞走的速度慢慢被带到圆轨道速度的这几成（0 = 没有漩涡）
 uniform float u_swirl;    // 漩涡带起来的快慢（每秒）：粒子从星体上离开时几乎静止，被吸进去的路上越转越快
+uniform float u_hold;     // 刚剥下来的这么多秒里先不受引力（展开倒放时 = 气体先汇到、停在原地，恒星再从里面凝出来）
 in vec4 in_a;             // x, y, z, 速度 x
 in vec4 in_b;             // 速度 y, 已过时间, 第几步掉进视界（-1 = 还没有）, 阻力倍数
 out vec4 out_a; out vec4 out_b;
@@ -616,11 +618,12 @@ void main(){
         float r = length(p.xy) + 1e-3;
         vec2 u = -p.xy / r;
         float m = max(r, u_RS * 1.2);
-        v += u * (u_G / (m * m)) * u_dt;
+        float pull = smoothstep(u_hold, u_hold + 0.25, age);
+        v += u * (u_G / (m * m)) * pull * u_dt;
         float early = 2.8 * drag * exp(-age * 2.5);
         v *= exp(-early * u_dt);
         vec2 tdir = vec2(-u.y, u.x);
-        v += tdir * (u_orbit * sqrt(u_G / m) - dot(v, tdir)) * (1.0 - exp(-u_swirl * u_dt));
+        v += tdir * (u_orbit * sqrt(u_G / m) - dot(v, tdir)) * (1.0 - exp(-u_swirl * pull * u_dt));
         float vr = dot(v, u); vec2 vt = v - vr * u;
         vr *= exp(-u_KR * u_dt);
         float disk = 5.0 * clamp((u_RS * 4.0 - r) / (u_RS * 3.0), 0.0, 1.0);
@@ -698,7 +701,7 @@ void main(){
             ext = max(0.6, i_b.w * min(1.6, kk)) * 5.0;
             v_local = in_corner * 5.0;
         } else {                              // 气体：按世界大小的一团柔光；刚从星体上剥下来时小一点，0.4 秒内胀成一团
-            ext = max(1.5, i_b.w * kk * mix(0.45, 1.0, smoothstep(0.0, 0.4, born))) * 2.0;
+            ext = max(1.5, i_b.w * kk * mix(0.75, 1.0, smoothstep(0.0, 0.4, born))) * 2.0;
             v_local = in_corner * 2.0;
         }
     } else {                                  // 残留气云：撕开的地方一大团淡淡的光，慢慢胀大、淡掉
