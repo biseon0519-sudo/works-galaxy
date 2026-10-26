@@ -720,6 +720,7 @@ class Node:
         self.seed = r.random()
         self.d, self.v = [0.0, 0.0], [0.0, 0.0]      # 鼠标扰动的偏移和速度（只在平面上）
         self.glow = 0.0                 # 悬停亮度 0~1，慢慢过渡
+        self.link_fade = 1.0            # 连到父节点的线的显示程度：拖动这颗恒星时藏起来，放下后淡入
         self.sx = self.sy = 0.0         # 这一帧在屏幕上的位置（像素）
         self.k = 1.0                    # 这一帧的透视缩放（含镜头缩放）
         self.rpx = 0.0                  # 黑洞：这一帧阴影在屏幕上的半径
@@ -1427,7 +1428,7 @@ class MindMap(QOpenGLWidget):
             a = self.nodes.get(n.parent_key)
             if a is None:
                 continue
-            op = min(a.opacity, n.opacity) * self.link_fade
+            op = min(a.opacity, n.opacity) * self.link_fade * n.link_fade
             alive.add(n.key)
             if op < 0.02:
                 continue
@@ -1827,7 +1828,13 @@ class MindMap(QOpenGLWidget):
             self.link_fade = max(0.0, self.link_fade - dt * 10)
         else:
             self.link_fade = min(1.0, self.link_fade + dt * 3.5)
+        dragged = self._drag_star if (self._press and self._press[1]) else None
         for n in self.nodes.values():
+            # 拖着的恒星：物质流马上藏起来，放下后从新位置重新淡入（拖动时链子跟着弯有塑料感）
+            if n is dragged:
+                n.link_fade = max(0.0, n.link_fade - dt * 10)
+            elif n.link_fade < 1.0:
+                n.link_fade = min(1.0, n.link_fade + dt * 3.5)
             # 鼠标扰动：弹簧把节点拉回原位，阻尼接近临界，像在水里一样慢慢漂回去
             for i in (0, 1):
                 if n.d[i] or n.v[i]:
@@ -1844,7 +1851,8 @@ class MindMap(QOpenGLWidget):
         self._busy = (self.anim.running or self.cam.running or 0.0 < self.link_fade < 1.0 or now - self._last_input < IDLE_AFTER
                       or self.cine != self._cine_target() or self.rebirth is not None or len(self.dust) > 0
                       or now - self._gulp_t < 1.8 or len(self.shards) > 0
-                      or any(n.v[0] or n.v[1] or n.glow != (1.0 if n.hover else 0.0) for n in self.nodes.values()))
+                      or any(n.v[0] or n.v[1] or n.link_fade < 1.0 or n.glow != (1.0 if n.hover else 0.0)
+                             for n in self.nodes.values()))
         if len(self.shards):                    # 碎片：迸开 → 引力接管，旋进黑洞
             # 按真实经过的时间分成小步积分：卡了一下（或截图）之后也能追上，不会变慢
             steps = max(1, math.ceil(raw_dt * SIM_HZ))
@@ -1987,6 +1995,7 @@ class MindMap(QOpenGLWidget):
         press, self._press = self._press, None
         star, self._drag_star = self._drag_star, None
         if star is not None and press and press[1]:
+            self._trails.pop(star.key, None)    # 尾迹从放下的位置重新记，淡入时不会从旧位置甩过来
             self._save_star(star)
             self._set_hover(self.node_at(e.position()))
             return
