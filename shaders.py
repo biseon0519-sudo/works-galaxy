@@ -1,4 +1,7 @@
 # 导图的着色器（GLSL 3.3）：背景星空、黑洞光追、恒星、水晶胶囊、连线、晶尘、文字、缩小到屏幕
+# 物质流、恒星解体的气体是很多颗很淡的粒子叠出来的。中间画布改成浮点（见 mindmap 的 HDR 部分）以前，每颗粒子边缘
+# 不到 1/255 的光会被舍掉；浮点画布全保留，整体会亮一些。乘这个系数，让整体亮度和以前调好的差不多（边缘更柔和）
+GAS_K = 0.8
 NOISE = '''
 float hash(vec2 p){ p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
 float noise(vec2 p){ vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3. - 2. * f);
@@ -233,6 +236,9 @@ void main(){
 # 边上一圈色球层和一缕缕往外喷的日珥，外面是带放射状亮纹的日冕。朝黑洞那一侧被潮汐轻轻拉出一点，物质从那里被吸走
 STAR_FS = '''
 #version 330
+#define STAR_EXPO 0.85
+#define PALE_K 0.8
+#define PALE_SAT 1.0
 uniform float u_time;
 in vec2 v_local; flat in vec4 v_color; flat in vec4 v_p1; flat in vec4 v_p2;
 out vec4 f;
@@ -257,17 +263,12 @@ float granules(vec3 p){
 void main(){
     float R = v_p1.x, hv = v_p1.y, op = v_p1.z, act = v_p1.w, seed = v_p2.x, bright = v_p2.y;
     float tear = v_p2.z, dang = v_p2.w;
-    float tide = v_color.a;                                 // 被潮汐拉长的程度：0 = 圆的（展开时刚汇成是拉长的，慢慢恢复）
     float t = u_time;
     vec2 q = v_local / R, q0 = q;
     vec3 c = v_color.rgb;
     vec2 dd = vec2(cos(dang), sin(dang));                   // 指向黑洞
     float al = dot(q, dd);
     q -= dd * max(al, 0.0) * 0.08 / 1.08;                   // 潮汐：朝黑洞那半边轻轻鼓出来一点
-    if (tide > 0.0){                                        // 潮汐：顺着指向黑洞的方向被拉长，两侧被挤扁
-        float al2 = dot(q, dd);
-        q = dd * al2 / (1.0 + 0.45 * tide) + (q - dd * al2) * (1.0 + 0.18 * tide);
-    }
     float r = length(q);
     float body = 1.0 - smoothstep(0.97, 1.02, r);
     float keep = 1.0, rim = 0.0, body0 = body;              // body0：化开之前的星体范围（外圈柔光只画在它外面）
@@ -305,15 +306,19 @@ void main(){
         I += smoothstep(0.6, 0.75, plasma) * pow(1.0 - mu, 1.5) * 0.4;      // 光斑：靠近边缘的亮网
         // 颜色按亮度从恒星本色里取：暗处是更浓的本色，中间是本色，最亮处偏白（像过曝的太阳照片）。
         // 白色、淡蓝的恒星本色太淡，先把饱和度提上去，不然表面是灰的，像月亮
-        vec3 cs = clamp(mix(vec3(dot(c, vec3(0.3, 0.59, 0.11))), c, 2.6), 0.0, 1.0);
+        float pale = smoothstep(0.55, 0.9, min(c.r, min(c.g, c.b)));
+        vec3 cs = clamp(mix(vec3(dot(c, vec3(0.3, 0.59, 0.11))), c, 2.6 + PALE_SAT * pale), 0.0, 1.0);
         vec3 deep = pow(cs, vec3(2.0)) * 0.9, hot = mix(cs, vec3(1.0, 0.98, 0.94), 0.5);
         vec3 sc = I < 0.6 ? mix(deep, cs, I / 0.6) : mix(cs, hot, min(1.0, (I - 0.6) / 0.6));
         surf = sc * (0.9 + 1.7 * I);
-        surf *= 1.0 + 0.2 * tide;                           // 被撕开前越来越亮（被挤压、加热）
+        // 白色、淡蓝的恒星三个通道都接近 1，同样的亮度一乘全挤到顶上，中间一片死白看不出纹理（黄色的蓝通道低，不会）：
+        // 越白的表面曝光越低（PALE_K），同时颜色再浓一点（上面的 PALE_SAT），不然压暗了是灰的，像月亮。
+        // STAR_EXPO：所有恒星表面整体的亮度（HDR 屏上整颗白亮的恒星太刺眼）
+        surf *= STAR_EXPO * mix(1.0, PALE_K, pale);
     }
     float o = max(r - 1.0, 0.0);
     vec2 dir = q / max(r, 1e-4);
-    float lift = (0.85 + 0.4 * hv + 0.3 * act) * bright * (0.94 + 0.06 * sin(t * 1.6 + seed * 20.0)) * (1.0 + 0.2 * tide);
+    float lift = (0.85 + 0.4 * hv + 0.3 * act) * bright * (0.94 + 0.06 * sin(t * 1.6 + seed * 20.0));
     // 色球层：贴着边缘的一圈细亮边；日珥：边上一缕缕往外喷的火焰；日冕：柔光 + 放射状亮纹
     float chrom = exp(-o * 28.0) * smoothstep(0.9, 1.0, r);
     float flame = fbm3(vec3(dir * 3.2 + seed * 17.0, o * 7.0 - t * 0.3));
@@ -576,6 +581,7 @@ void main(){
 STREAM_FS = '''
 #version 330
 uniform float u_time;
+uniform float u_gas;
 in vec2 v_local; flat in vec4 v_col; flat in vec2 v_kind;
 out vec4 f;
 void main(){
@@ -584,7 +590,7 @@ void main(){
     float d2 = dot(q, q);
     float win = 1.0 - smoothstep(1.6, 2.0, max(abs(q.x), abs(q.y)));
     float I;
-    if (v_kind.x < 0.5) I = exp(-d2 * 1.6) * 0.04;           // 一团薄薄的发光气体，叠在一起才是浓的
+    if (v_kind.x < 0.5) I = exp(-d2 * 1.6) * 0.04 * u_gas;           // 一团薄薄的发光气体，叠在一起才是浓的
     else {                                                    // 亮点，会闪
         float tw = 0.6 + 0.4 * sin(u_time * (3.0 + 4.0 * v_kind.y) + v_kind.y * 40.0);
         I = exp(-d2 * 3.0) * 0.9 * tw;
@@ -601,7 +607,7 @@ SHARD_SIM_VS = '''
 #version 330
 uniform float u_dt;
 uniform int u_pass;
-uniform float u_G, u_RS, u_KT, u_KR;
+uniform float u_G, u_RS, u_KT;
 uniform float u_orbit;    // 漩涡：绕黑洞走的速度慢慢被带到圆轨道速度的这几成（0 = 没有漩涡）
 uniform float u_swirl;    // 漩涡带起来的快慢（每秒）：粒子从星体上离开时几乎静止，被吸进去的路上越转越快
 uniform float u_hold;     // 刚剥下来的这么多秒里先不受引力（展开倒放时 = 气体先汇到、停在原地，恒星再从里面凝出来）
@@ -625,7 +631,6 @@ void main(){
         vec2 tdir = vec2(-u.y, u.x);
         v += tdir * (u_orbit * sqrt(u_G / m) - dot(v, tdir)) * (1.0 - exp(-u_swirl * pull * u_dt));
         float vr = dot(v, u); vec2 vt = v - vr * u;
-        vr *= exp(-u_KR * u_dt);
         float disk = 5.0 * clamp((u_RS * 4.0 - r) / (u_RS * 3.0), 0.0, 1.0);
         vt *= exp(-(u_KT + disk) * u_dt);
         v = vr * u + vt;
@@ -641,7 +646,7 @@ void main(){
 }
 '''
 
-# 画撕开的气体：按时间从记下的路线里取位置（收起正着放，展开倒着放），投影到屏幕；越靠近黑洞越贴近盘面，进视界消失
+# 画解体的气体：按时间从记下的路线里取位置（收起正着放，展开倒着放），投影到屏幕；越靠近黑洞越贴近盘面，进视界消失
 SHARD_VS = '''
 #version 330
 uniform vec2 u_vp;
@@ -657,7 +662,7 @@ in vec2 in_corner;
 in vec4 i_a;              // 起点 x、y、z，编号
 in vec4 i_b;              // 开始时间，路线有几步，种类（0 亮点 / 1 气体 / 2 残留气云），大小
 in vec4 i_c;              // 颜色 r、g、b，随机数
-in vec4 i_d;              // 被撕到的时刻（秒），亮点的亮度，（没用），亮点变暗的快慢（秒）
+in vec4 i_d;              // 从星体上剥下来的时刻（秒），亮点的亮度，（没用），亮点变暗的快慢（秒）
 out vec2 v_local;
 flat out vec4 v_col;      // 颜色、透明度
 flat out vec4 v_par;      // 亮点的亮度 / 离黑洞多近，随机数，被撕下来多久（秒），种类
@@ -720,6 +725,7 @@ void main(){
 SHARD_FS = '''
 #version 330
 uniform float u_time;
+uniform float u_gas;
 in vec2 v_local; flat in vec4 v_col; flat in vec4 v_par;
 out vec4 f;
 ''' + NOISE + '''
@@ -743,12 +749,12 @@ void main(){
     } else if (kind < 1.5){
         // 气体：一团薄薄的发光等离子体（和物质流同一种画法），叠在一起就是恒星化开的那一大片；
         // 颜色从恒星本色慢慢变成吸积盘的暖色，越靠近黑洞越亮
-        col = mix(cs * 1.2, vec3(1.0, 0.72, 0.42), heat) * (1.0 + 1.2 * heat) * exp(-dot(q, q) * 1.6) * 0.017;
+        col = mix(cs * 1.2, vec3(1.0, 0.72, 0.42), heat) * (1.0 + 1.2 * heat) * exp(-dot(q, q) * 1.6) * 0.017 * u_gas;
         col *= 1.0 + 0.8 * (1.0 - smoothstep(0.0, 0.6, born));   // 刚从星体上散出来时亮一些，0.6 秒内暗下来
     } else {
         // 残留气云：边缘不规则的一团淡光，恒星本色偏暖
         float cloud = 0.55 + 0.9 * fbm(q * 1.3 + seed * 17.0 + u_time * 0.05);
-        col = mix(cs, vec3(1.0, 0.6, 0.35), 0.35) * exp(-dot(q, q) * 1.4) * cloud * 0.04;
+        col = mix(cs, vec3(1.0, 0.6, 0.35), 0.35) * exp(-dot(q, q) * 1.4) * cloud * 0.04 * u_gas;
     }
     f = vec4(col * op * win, 0.0);
 }
@@ -785,10 +791,72 @@ void main(){
 }
 '''
 
+# ---------- 内部 HDR：中间画布都是 16 位浮点，最后一遍统一处理 ----------
+# 辉光：从画面里取出亮的部分，一层层缩小（每层一半），再一层层放大叠回来，得到由近到远都有的柔光
+BLOOM_DOWN_FS = '''
+#version 330
+uniform sampler2D u_src;
+uniform vec2 u_texel;     // 源图一个像素的大小（uv）
+uniform float u_first;    // 1 = 第一层：只取亮的部分
+uniform float u_thresh, u_knee;
+in vec2 v_uv; out vec4 f;
+vec3 bright(vec3 c){
+    c = min(c, vec3(8.0));                                  // 个别特别亮的像素别闪成一大团
+    float l = max(c.r, max(c.g, c.b));
+    float s = clamp(l - u_thresh + u_knee, 0.0, 2.0 * u_knee);
+    s = s * s / (4.0 * u_knee + 1e-5);                      // 门槛附近平滑过渡，不是一刀切
+    return c * max(s, l - u_thresh) / max(l, 1e-5);
+}
+vec3 tap(vec2 o){
+    vec3 c = max(texture(u_src, v_uv + o * u_texel).rgb, 0.0);
+    return u_first > 0.5 ? bright(c) : c;
+}
+void main(){
+    vec3 c = tap(vec2(0.0)) * 4.0 + tap(vec2(-1.0, -1.0)) + tap(vec2(1.0, -1.0)) + tap(vec2(-1.0, 1.0)) + tap(vec2(1.0, 1.0));
+    f = vec4(c / 8.0, 1.0);
+}
+'''
+
+BLOOM_UP_FS = '''
+#version 330
+uniform sampler2D u_src;  // 小一级的那层
+uniform vec2 u_texel;
+in vec2 v_uv; out vec4 f;
+void main(){
+    vec3 c = vec3(0.0);
+    for (int x = -1; x <= 1; x++) for (int y = -1; y <= 1; y++)
+        c += texture(u_src, v_uv + vec2(x, y) * u_texel).rgb * float((2 - abs(x)) * (2 - abs(y)));
+    f = vec4(c / 16.0, 1.0);
+}
+'''
+
+# 最后一遍：超采样缩小到屏幕，统一压亮度：0.9 以下原样不动（和以前调好的画面一样），更亮的（以前会被截掉的叠加处）
+# 平滑地压进去，三个通道按同一个比例压（分开压会把黄色的恒星压得发白）；辉光主要照亮暗的周围，叠在本来就亮的地方很少（不会把恒星表面、吸积盘冲成一片白）；最后加一点抖动，深色渐变不出色带
+FINAL_FS = '''
+#version 330
+uniform sampler2D u_tex, u_bloom;
+uniform float u_bloom_k;
+in vec2 v_uv; out vec4 f;
+const float K = 0.9;
+vec3 shoulder(vec3 c){
+    float m = max(c.r, max(c.g, c.b));
+    return m <= K ? c : c * (K + (1.0 - K) * (1.0 - exp(-(m - K) / (1.0 - K)))) / m;
+}
+float ign(vec2 p){ return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+void main(){
+    vec3 c = shoulder(max(texture(u_tex, v_uv).rgb, 0.0));
+    vec3 b = shoulder(texture(u_bloom, v_uv).rgb * u_bloom_k);
+    vec3 room = 1.0 - min(c, 1.0);
+    c += b * room * room;                                   // 越亮的地方叠得越少，恒星表面的纹理不被冲淡
+    c += (ign(gl_FragCoord.xy) + ign(gl_FragCoord.xy + vec2(47.0, 17.0)) - 1.0) / 255.0;
+    f = vec4(c, 1.0);
+}
+'''
+
+# 把按屏幕原分辨率单独画的黑洞放大叠进超采样画布（保留透明度）
 DOWN_FS = '''
 #version 330
 uniform sampler2D u_tex;
-uniform float u_keep;     // 1 = 保留透明度（把单独画的黑洞叠上去），0 = 不透明（缩小到屏幕）
 in vec2 v_uv; out vec4 f;
-void main(){ vec4 c = texture(u_tex, v_uv); f = vec4(c.rgb, mix(1.0, c.a, u_keep)); }
+void main(){ f = texture(u_tex, v_uv); }
 '''

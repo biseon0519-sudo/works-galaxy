@@ -10,7 +10,7 @@ from PySide6.QtGui import QColor, QPainter, QImage, QFontMetricsF, QCursor, QSur
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from qfluentwidgets import RoundMenu, Action, FluentIcon as FIF
 from widgets import CoverPopup, font, DIGITS
-from shaders import QUAD_VS, SKY_FS, SPRITE_VS, HOLE_FS, STAR_FS, PILL_FS, BEAM_VS, BEAM_FS, DUST_FS, LABEL_FS, DOWN_FS
+from shaders import QUAD_VS, SKY_FS, SPRITE_VS, HOLE_FS, STAR_FS, PILL_FS, BEAM_VS, BEAM_FS, DUST_FS, LABEL_FS, DOWN_FS,     BLOOM_DOWN_FS, BLOOM_UP_FS, FINAL_FS
 from shards import ShardSystem, debris, life_steps, SIM_HZ, SHARD_G
 from stream import StreamSystem, MAX_STARS
 
@@ -26,6 +26,9 @@ DISK_COLOR = QColor('#ffb36b')        # 黑洞吸积盘的颜色，中心到年�
 
 SS = 2                    # 超采样倍数（内部按几倍分辨率画）
 MAX_TEX = 4096            # 内部画布最大边长
+# 内部 HDR：中间画布都是 16 位浮点，叠加的光不会被截断，很淡的粒子也不会被舍掉；最后一遍统一加辉光、压亮度、抖动（FINAL_FS）。
+# 辉光从画面里比 BLOOM_T 亮的部分取（文字不算），BLOOM_LEVELS 层由近到远的柔光，BLOOM_K 是强度
+BLOOM_T, BLOOM_KNEE, BLOOM_K, BLOOM_LEVELS = 0.7, 0.25, 0.6, 6
 RS = 34                   # 全图时黑洞阴影（看到的黑色圆）的半径（世界坐标）
 EL_MAP, EL_CINE = 0.22, 0.10          # 黑洞仰角（弧度）：全图稍微斜着看；展开时几乎侧视，像飞船飞到黑洞旁边
 # 展开时黑洞很大、偏左上、一部分在画面外，像坐飞船飞到了黑洞边上（用户自己调出来的位置）：
@@ -38,7 +41,7 @@ CINE_ROLL = -0.10         # 展开时黑洞稍微歪一点，更有镜头感
 CINE_STAR_X = 0.34        # 展开时恒星的位置（占宽度）：在黑洞下面偏左，挡在黑洞前面，右边留给分支
 DISK_OUT = 6.2            # 吸积盘外缘（以视界半径为单位，和着色器里的 R_OUT 一致）
 ANIM_S, CAM_S = 1.1, 1.1  # 动画时长（秒）：普通移动、镜头（展开时恒星重建的时长按模拟出来的算）
-# 收起：恒星不被吸过去、不拉长，原地直接解体（亮一下，整颗化开、变淡，像胶囊碎掉那样），化开的气体先往外迸一下、
+# 收起：恒星原地解体（亮一下，从外往里一层层化开），化开的气体轻轻飘开、
 # 很快被刹住，再被黑洞吸进去。引力弱一些、绕黑洞走得快一些，所以是绕着黑洞慢慢旋进去（用户要的拉扯感、不用收得太利索）。
 # 气体在显卡上整段模拟（见 shards.py）。差不多吞完时黑洞亮一下、荡开一圈涟漪
 C_TEAR_S = 0.35           # 原地化开要多久
@@ -222,15 +225,14 @@ class Node:
         self.sx = self.sy = 0.0         # 这一帧在屏幕上的位置（像素）
         self.k = 1.0                    # 这一帧的透视缩放（含镜头缩放）
         self.rpx = 0.0                  # 黑洞：这一帧阴影在屏幕上的半径
-        self.swallow = None             # 收起时正被黑洞吸过去：(起点, 起点的 z, 碎开前多等的秒数)；胶囊是 None（原地碎成晶尘）
-        self.shattered = False          # 已经碎成水晶碎片（星体消失）
-        self.dang = 0.0                 # 被拉长的方向（展开时：指向黑洞）
-        self.fresh = False              # 刚出现（年份由黑洞里冲出来的碎片凝结出来）
+        self.swallow = None             # 收起时恒星原地解体：(位置, z, 解体前多等的秒数)；胶囊是 None（原地碎成晶尘）
+        self.shattered = False          # 已经开始解体（不再往外喷物质流）
+        self.dang = 0.0                 # 解体时朝向黑洞的方向
+        self.fresh = False              # 刚出现（年份由黑洞里喷出来的气体汇成）
         self.birth_at = 0.0             # 刚出现的恒星在动画开始后第几秒凝结
         self.drift_w = 1.0              # 漂浮的幅度：刚汇成的恒星先不漂（气体汇到的是没漂浮的位置），慢慢恢复，不然一成形就跳一下
         self.form = 1.0                 # 恒星凝结的程度 0~1
-        self.flash = 0.0                # 碎开前、凝结时亮一下
-        self.tide = 0.0                 # 被潮汐拉长的程度 0~1（展开时刚汇成是拉长的，慢慢恢复成圆的）
+        self.flash = 0.0                # 解体前、凝结时亮一下
         self.tear = 0.0                 # 化开了多少 0~1（收起时原地化开；展开时倒过来，气体汇成星体）
 
     def round(self):
@@ -536,33 +538,27 @@ class MindMap(QOpenGLWidget):
                 self._finish_sim(job)
 
     def _start_sim(self, job):
-        """按每颗恒星碎开的位置算出碎片，交给显卡模拟。"""
+        """按每颗恒星解体的位置算出气体，交给显卡模拟。"""
         rng = np.random.default_rng()
         init, look, owner, at = [], [], [], []
+        collapse = job['kind'] == 'collapse'
         for i, n in enumerate(job['nodes']):
-            if job['kind'] == 'collapse':
+            if collapse:
                 # 原地解体的位置和时刻（加上那一刻的漂浮），每颗错开的时间见 _step
                 start, z0, lag = n.swallow
                 ts = lag * self.anim.dur / SWALLOW_S
                 dx, dy = n.drift(job['t0'] + ts)
-                x0, y0, z = start.x() + dx, start.y() + dy, z0
+                a, b = debris(rng, n.color, start.x() + dx, start.y() + dy, z0, STAR_R * 1.1, C_TEAR_S, True, burst=C_BURST)
             else:
-                # 展开：在恒星自己的位置正着模拟一遍“被吞掉”，之后倒着放（气体汇过来，恒星原地成形）
+                # 展开：在恒星自己的位置正着模拟一遍“被吞掉”，之后倒着放（气体汇过来，恒星原地成形）。
+                # 气体从黑洞沿直线喷出、先快后慢（用户要的），所以正着模拟时从静止开始、只沿直线掉进去（没有漩涡），
+                # 倒着放时气体正好在汇到恒星的那一刻慢到停住，不会冲过头“跳一下”
                 ts = 0.0
-                x0, y0, z = n.base.x(), n.base.y(), n.z
-            fx = job['kind'] == 'collapse' or REBIRTH_FX
-            if job['kind'] == 'collapse':
-                a, b = debris(rng, n.color, x0, y0, z, STAR_R * 1.1, 1.0, 1.0, C_TEAR_S, fx, C_G, C_ORBIT, 0.0,
-                              carry=0.0, burst=C_BURST)
-            else:
-                # 展开：气体从黑洞沿直线喷出、先快后慢（用户要的，和以前那版一样），所以正着模拟时只沿直线掉进去
-                # 从静止开始掉（不带初速度、不拉开），倒着放时气体正好在汇到恒星的那一刻慢到停住，不会冲过头“跳一下”
-                a, b = debris(rng, n.color, x0, y0, z, STAR_R * 1.1, 1.0, 1.0, DISSOLVE_S, fx, tidal_k=0.0,
-                              straight=True, carry=0.0)
+                a, b = debris(rng, n.color, n.base.x(), n.base.y(), n.z, STAR_R * 1.1, DISSOLVE_S, REBIRTH_FX)
             init.append(a); look.append(b); owner.append(np.full(len(a), i)); at.append(np.full(len(a), ts))
         job['look'], job['owner'], job['at'] = map(np.concatenate, (look, owner, at))
         job['rng'] = rng
-        if job['kind'] == 'collapse':
+        if collapse:
             job['sim'] = self.parts.simulate(np.concatenate(init), C_G, C_ORBIT, C_SWIRL)
         else:
             # 展开：气体剥下来后先停在原地 DISSOLVE_S 再往里掉，倒着放 = 气体先汇到、停住，恒星再从里面凝出来
@@ -605,7 +601,7 @@ class MindMap(QOpenGLWidget):
                 node.opacity = 0.0 if animate else 1.0
                 node.fresh = animate
                 self.nodes[key] = node
-                if polar is not None:       # 新出来的年份：由黑洞喷出来的碎片在新位置附近凝结，再退回自己的位置
+                if polar is not None:       # 新出来的年份：黑洞喷出来的气体在它自己的位置汇成
                     node.polar0, node.base, node.z = polar, QPointF(pos), z
                     if animate:
                         node.form, node.drift_w = 0.0, 0.0
@@ -627,7 +623,7 @@ class MindMap(QOpenGLWidget):
                 node.removing = True
                 par = targets.get(node.parent_key)
                 if node.kind == 'year':
-                    # 先被黑洞吸过去一段，再清脆地碎开（见 _step）；每颗碎开的时间错开一点
+                    # 原地解体（见 _step），每颗解体的时间错开一点
                     node.base += node.offset(now) - QPointF(*node.d)    # 从现在看到的位置出发
                     node.swallow = (QPointF(node.base), node.z, random.uniform(0.0, 0.3))
                     node.shattered = not animate
@@ -669,13 +665,13 @@ class MindMap(QOpenGLWidget):
                 n.opacity = n.o0 * (1 - smooth(0.0, 0.18, raw))
                 continue
             if n.removing:
-                # 先被黑洞吸过去一段、越来越快，被潮汐拉长、越来越亮，然后整颗化成气体被撕开（星体消失，气体接上）
+                # 原地亮一下，从外往里一层层化成气体（星体消失的地方气体接上，见 shards.debris）
                 start, z0, lag = n.swallow
                 after = raw * SWALLOW_S - lag                     # 开始解体之后过了多久（秒，之前是负的）
                 n.base, n.z = QPointF(start), z0
                 n.dang = math.atan2(-start.y(), -start.x())
                 n.flash = 0.4 * smooth(-0.06, 0.0, after) * (1 - smooth(0.04, C_TEAR_S, after))    # 解体前亮一下
-                n.tide, n.tear = 0.0, min(1.0, max(0.0, after) / C_TEAR_S)
+                n.tear = min(1.0, max(0.0, after) / C_TEAR_S)
                 n.d = [0.0, 0.0]
                 if after >= 0.0:
                     n.shattered = True
@@ -698,7 +694,7 @@ class MindMap(QOpenGLWidget):
                 n.opacity = 1.0 if tau > -DISSOLVE_S * 1.2 else 0.0
                 n.form = 1.0
                 n.flash = 0.35 * smooth(-0.05, 0.0, tau) * (1 - smooth(0.05, 0.5, tau))
-                n.tide, n.tear = 0.0, min(1.0, max(0.0, -tau) / DISSOLVE_S)
+                n.tear = min(1.0, max(0.0, -tau) / DISSOLVE_S)
 
     def _finish(self):
         for key in [k for k, n in self.nodes.items() if n.removing]:
@@ -706,7 +702,7 @@ class MindMap(QOpenGLWidget):
         for n in self.nodes.values():
             n.polar0 = n.polar1
             n.fresh = False
-            n.form, n.flash, n.tide, n.tear, n.drift_w = 1.0, 0.0, 0.0, 0.0, 1.0
+            n.form, n.flash, n.tear, n.drift_w = 1.0, 0.0, 0.0, 1.0
             if n.polar1 is not None:
                 a, r = n.polar1
                 n.base = QPointF(r * math.cos(a), r * math.sin(a))
@@ -825,6 +821,12 @@ class MindMap(QOpenGLWidget):
         self.p_down = ctx.program(vertex_shader=QUAD_VS, fragment_shader=DOWN_FS)
         self.v_sky = ctx.vertex_array(self.p_sky, [(quad, '2f', 'in_pos')])
         self.v_down = ctx.vertex_array(self.p_down, [(quad, '2f', 'in_pos')])
+        self.p_final = ctx.program(vertex_shader=QUAD_VS, fragment_shader=FINAL_FS)
+        self.v_final = ctx.vertex_array(self.p_final, [(quad, '2f', 'in_pos')])
+        self.p_bdown = ctx.program(vertex_shader=QUAD_VS, fragment_shader=BLOOM_DOWN_FS)
+        self.v_bdown = ctx.vertex_array(self.p_bdown, [(quad, '2f', 'in_pos')])
+        self.p_bup = ctx.program(vertex_shader=QUAD_VS, fragment_shader=BLOOM_UP_FS)
+        self.v_bup = ctx.vertex_array(self.p_bup, [(quad, '2f', 'in_pos')])
         self.sprites = {}
         for name, fs in (('hole', HOLE_FS), ('star', STAR_FS), ('pill', PILL_FS), ('dust', DUST_FS), ('label', LABEL_FS)):
             prog = ctx.program(vertex_shader=SPRITE_VS, fragment_shader=fs)
@@ -843,14 +845,17 @@ class MindMap(QOpenGLWidget):
         self.parts = ShardSystem(ctx, RS, FOCAL)
         self.stream = StreamSystem(ctx)
 
-    def _offscreen(self, name, w, h):
-        """离屏画布（按名字各一块，尺寸变了重建）：main 是超采样的整张图，hole 是按屏幕原分辨率单独画的黑洞。"""
+    def _offscreen(self, name, w, h, clamp=False):
+        """离屏画布（按名字各一块，尺寸变了重建，16 位浮点）：main 是超采样的整张图，hole 是按屏幕原分辨率单独画的黑洞，
+        bloom0… 是辉光一层层缩小的图。clamp：取样超出边缘时用边上的颜色（辉光用，不然左边的光会从右边冒出来）。"""
         old = self.off.get(name)
         if old is None or old[1] != (w, h):
             if old is not None:
                 old[0].release(); old[2].release()
-            tex = self.ctx.texture((w, h), 4)
+            tex = self.ctx.texture((w, h), 4, dtype='f2')
             tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            if clamp:
+                tex.repeat_x = tex.repeat_y = False
             self.off[name] = (self.ctx.framebuffer(color_attachments=[tex]), (w, h), tex)
         return self.off[name]
 
@@ -969,24 +974,52 @@ class MindMap(QOpenGLWidget):
         if pills:
             self._draw('pill', np.array(pills, 'f4'), False, vw, vh, t)
         self._draw_particles(vw, vh, t)
+        bloom = self._bloom(tex, int(vw * dpr), int(vh * dpr))     # 辉光在写字之前取，字不发光
+        fbo.use(); ctx.viewport = (0, 0, W, H)
+        ctx.enable(moderngl.BLEND)
         labels = self._label_instances(dpr * ss)
         if len(labels):
             self.atlas[0].use(0)
             self._draw('label', labels, False, vw, vh, t, u_atlas=0)
 
-        # 缩小到屏幕（超采样）
+        # 缩小到屏幕（超采样）+ 辉光，统一压亮度
         screen = ctx.detect_framebuffer(self.defaultFramebufferObject())
         screen.use(); ctx.viewport = (0, 0, int(vw * dpr), int(vh * dpr))
         ctx.disable(moderngl.BLEND)
-        tex.use(0)
-        self._set(self.p_down, u_tex=0, u_keep=0.0)
-        self.v_down.render(moderngl.TRIANGLE_STRIP)
+        tex.use(0); bloom.use(1)
+        self._set(self.p_final, u_tex=0, u_bloom=1, u_bloom_k=BLOOM_K / BLOOM_LEVELS)
+        self.v_final.render(moderngl.TRIANGLE_STRIP)
         # 把显卡状态复原，免得影响 Qt 自己合成窗口
         f = self.context().extraFunctions()
         f.glBindVertexArray(0); f.glUseProgram(0); f.glBindBuffer(0x8892, 0)
         f.glActiveTexture(0x84C0); f.glBindTexture(0x0DE1, 0)         # GL_TEXTURE0、GL_TEXTURE_2D
         f.glBindSampler(0, 0)
         f.glPixelStorei(0x0CF5, 4); f.glPixelStorei(0x0D05, 4)        # 解包 / 打包对齐恢复默认
+
+    def _bloom(self, src, w, h):
+        """辉光：先取出亮的部分缩成屏幕一半大小，再一层层缩小（每层一半），然后从最小的一层往回放大、叠到上一层，
+        得到由近到远都有的柔光。返回最大的那层（屏幕一半大小）。"""
+        ctx = self.ctx
+        levels = []
+        for i in range(BLOOM_LEVELS):
+            w, h = max(1, w // 2), max(1, h // 2)
+            levels.append(self._offscreen(f'bloom{i}', w, h, clamp=True))
+        ctx.disable(moderngl.BLEND)
+        prev = src
+        for i, (fbo, (w, h), tex) in enumerate(levels):
+            fbo.use(); ctx.viewport = (0, 0, w, h)
+            prev.use(0)
+            self._set(self.p_bdown, u_src=0, u_texel=(0.5 / w, 0.5 / h), u_first=float(i == 0), u_thresh=BLOOM_T, u_knee=BLOOM_KNEE)
+            self.v_bdown.render(moderngl.TRIANGLE_STRIP)
+            prev = tex
+        ctx.enable(moderngl.BLEND)
+        ctx.blend_func = moderngl.ONE, moderngl.ONE
+        for (fbo, (w, h), _), (_, (sw, sh), small) in zip(levels[-2::-1], levels[:0:-1]):
+            fbo.use(); ctx.viewport = (0, 0, w, h)
+            small.use(0)
+            self._set(self.p_bup, u_src=0, u_texel=(1 / sw, 1 / sh))
+            self.v_bup.render(moderngl.TRIANGLE_STRIP)
+        return levels[0][2]
 
     def _draw_sky(self, fbo, W, H, dpr, t):
         """背景分两遍：柔和的银河、星云按屏幕一半的分辨率画，再按超采样分辨率叠上锐利的星星。"""
@@ -1026,11 +1059,11 @@ class MindMap(QOpenGLWidget):
                                                                          self.bh[3], self.bh[4], self.cine_ease(), 0))
             elif n.kind == 'year':
                 R = STAR_R * n.k * (1 + 0.12 * n.glow + STAR_ACTIVE * n.active) * (0.2 + 0.8 * n.form)
-                R *= (1 + 0.15 * n.flash) * (1 + 0.15 * n.tide)     # 被拉长时精灵要放大一点，不然拉长的那头会被方框切掉
+                R *= 1 + 0.15 * n.flash
                 bright = 0.75 + 0.25 * max(-1, min(1, n.z / 140))
-                # 朝向：平时指向黑洞（潮汐拉出的那一侧），被吞时是运动方向
+                # 朝向黑洞（潮汐鼓出的那一侧）
                 ang = n.dang if n.removing else math.atan2(self.bh[1] - n.sy, self.bh[0] - n.sx)
-                stars.append((n.sx, n.sy, R * 5, R * 5) + _rgba(n.color, n.tide) + (R, n.glow + 3 * n.flash, n.opacity * self._retreat(n), 1.0 if n.active else 0.0,
+                stars.append((n.sx, n.sy, R * 5, R * 5) + _rgba(n.color, 0.0) + (R, n.glow + 3 * n.flash, n.opacity * self._retreat(n), 1.0 if n.active else 0.0,
                                                                                  n.seed, bright, n.tear, ang))
             else:
                 k = n.k * (1 + 0.06 * n.glow)
@@ -1077,7 +1110,7 @@ class MindMap(QOpenGLWidget):
         fbo.use(); ctx.viewport = (0, 0, W, H)
         htex.use(0)
         ctx.blend_func = moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA
-        self._set(self.p_down, u_tex=0, u_keep=1.0)
+        self._set(self.p_down, u_tex=0)
         self.v_down.render(moderngl.TRIANGLE_STRIP)
 
     def _draw_particles(self, vw, vh, t):

@@ -110,9 +110,6 @@ class CoverBox(QWidget):
         self.setToolTip('点击选择图片；也可以把图片拖进来，或者点一下这里再按 Ctrl+V 粘贴截图')
         self.installEventFilter(ToolTipFilter(self, 400, ToolTipPosition.TOP))
 
-    def has_cover(self):
-        return self.image is not None or (not self.removed and store.cover_path(self.work) is not None)
-
     def set_image(self, img):
         if img is not None and not img.isNull():
             self.image, self.removed = img, False

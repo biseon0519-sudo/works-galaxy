@@ -1,10 +1,10 @@
-# 恒星被黑洞撕碎（潮汐瓦解）。点下去的那一刻，用显卡把所有气体的运动整段模拟出来（transform feedback，一遍算 8 步），
+# 恒星解体成气体被黑洞吸进去。点下去的那一刻，用显卡把所有气体的运动整段模拟出来（transform feedback，一遍算 8 步），
 # 路线存成一张显存里的纹理；之后每帧显卡按时间从纹理里取位置来画——收起正着放，展开倒着放（展开 = 收起倒放），
 # CPU 不用逐帧算。每颗恒星化成多少团气体、各自的初速度在 CPU 上算一次。
 import math
 import numpy as np
 import moderngl
-from shaders import SHARD_SIM_VS, SHARD_VS, SHARD_FS
+from shaders import SHARD_SIM_VS, SHARD_VS, SHARD_FS, GAS_K
 
 SIM_HZ = 120              # 模拟、记录路线的步长（每秒多少步）
 SIM_STEPS = 7 * SIM_HZ    # 最多模拟 7 秒（没掉进去的气体 FADE_AT 秒后淡掉）
@@ -12,13 +12,9 @@ FADE_AT = 6.4
 PER_PASS = 8              # 显卡每一遍算几步（和 SHARD_SIM_VS 一致）
 STRIDE = 10 * 16          # 每团气体每一遍输出的字节数：状态 2 个 vec4 + 8 个位置
 TEX_W = 8192              # 路线纹理的宽度（一遍的数据按顺序铺进去，取的时候按编号算位置）
-# 引力按真实的平方反比：加速度 = SHARD_G / r²，朝着黑洞。恒星大小范围内近的一侧比远的一侧受的引力大，
-# 自己就会被拉成一长条（“意大利面化”）；再加上恒星本来绕着黑洞走的速度，这一长条会绕着黑洞旋进去
+# 引力按真实的平方反比：加速度 = SHARD_G / r²，朝着黑洞（收起时乘一个系数，见 mindmap.C_G）
 SHARD_G = 8e7
-SHARD_KT, SHARD_KR = 0.7, 0.0         # 横向、径向的阻力（靠近黑洞时横向阻力再加大，被盘接住）
-SHARD_CARRY = 120.0       # 恒星被撕开时本身正被吸过去的速度
-ORBIT = 0.55              # 恒星绕黑洞走的速度（圆轨道速度的几成），顺着吸积盘转的方向
-TIDAL = 90.0              # 潮汐：撕开那一刻，近的一侧已经比远的一侧走得快（拉长）、两侧往中间挤
+SHARD_KT = 0.7            # 横向阻力（靠近黑洞时再加大，被盘接住）
 SPARK, GAS, CLOUD = 0, 1, 2
 PER_STAR = (450, 80, 5)               # 每颗恒星化成多少团气体、亮点，撕开的地方留下几团残留气云（再多就太密太亮）
 CLOUD_S = 2.4             # 残留气云持续多久（秒）：它留在原地，不按模拟的路线走
@@ -31,56 +27,30 @@ def life_steps(look, done):
     return np.where(look[:, 6] == CLOUD, int(CLOUD_S * SIM_HZ), steps)
 
 
-def tidal(r):
-    """离黑洞多近（世界坐标的距离）→ 潮汐强度 0~1：150 以内最强，450 以外最弱。"""
-    t = min(1.0, max(0.0, (450.0 - r) / 300.0))
-    return t * t * (3 - 2 * t)
-
-
-def debris(rng, color, x0, y0, z0, R, long_=1.0, thin=1.0, tear_s=0.0, extras=True, g=SHARD_G, orbit=ORBIT, tidal_k=TIDAL,
-           straight=False, carry=SHARD_CARRY, burst=None):
-    """一颗半径 R 的恒星在世界坐标 (x0, y0, z0) 被撕开时化成的气体。离黑洞越近，拉得越长。
-    long_、thin：撕开那一刻星体已经顺着黑洞方向被拉长、两侧被挤扁的比例，气体就铺在同样的椭圆里，接得上。
-    tear_s：星体从朝黑洞的一侧到背面被撕完要多久，每团气体等撕到它那里才出现。
-    extras：要不要残留气云。g、orbit、tidal_k：引力强度、绕黑洞走的速度、潮汐拉开的力度（收起时调得更慢、更有拉扯感）。
-    straight：只沿“黑洞—恒星”方向运动、不绕不弯（展开用：倒着放就是从黑洞沿直线喷出、先快后慢）。
-    carry：整颗恒星本来被吸过去的速度。burst：(最小, 最大) 原地解体时往外迸的速度，迸一下就被阻力刹住（收起用）。
+def debris(rng, color, x0, y0, z0, R, tear_s=0.0, extras=True, burst=None):
+    """一颗半径 R 的恒星在世界坐标 (x0, y0, z0) 原地解体时化成的气体。
+    tear_s：星体从外往里蒸发完要多久，每团气体等蒸发到它那一层才出现。extras：要不要残留气云。
+    burst：(最小, 最大) 解体时朝各个方向轻轻飘开的速度（收起用）；None 是从静止开始（展开用：倒着放时气体汇到恒星那一刻正好停住）。
     返回 (模拟的初始状态 (N, 8)，画用的参数 (N, 16))；画用参数里的编号、开始时间、步数之后再填。"""
-    r0 = math.hypot(x0, y0) or 1.0
-    ur = np.array([x0 / r0, y0 / r0])           # 从黑洞指向恒星
-    ut = np.array([y0 / r0, -x0 / r0])          # 绕黑洞走的方向（和吸积盘在屏幕上的转向一致）
-    td = tidal(r0)
     ng, ns, nc = PER_STAR
     if not extras:
         nc = 0
     N = ng + ns + nc
     kind = np.repeat([GAS, SPARK, CLOUD], [ng, ns, nc])
-    rad, th = np.sqrt(rng.random(N)), rng.uniform(0, 6.2832, N)               # 铺满整个（被拉长的）恒星
+    rad, th = np.sqrt(rng.random(N)), rng.uniform(0, 6.2832, N)               # 铺满整个恒星
     rad[kind == CLOUD] *= 0.5                                                 # 气云挤在中间
-    along, side = rad * np.cos(th), rad * np.sin(th)                          # 沿着 / 垂直于“黑洞—恒星”方向的位置（-1~1）
-    off = (along * R * long_)[:, None] * ur + (side * R * thin)[:, None] * ut
-    vc = math.sqrt(g / r0)
-    # 整颗恒星一起：被吸过去 + 绕着黑洞走；各部分之间：近的一侧往里冲、远的一侧落在后面（拉长），
-    # 近的一侧绕得也快一点（剪切，拉出来的一条是弯的），两侧往中间挤
-    v_r = -carry * rng.uniform(0.9, 1.1) + along * tidal_k * (0.5 + td)
-    if straight:
-        # 每团气体沿“它所在的位置—黑洞”的直线运动（不加任何横向速度），倒着放就是从黑洞沿直线喷出来
-        pos = np.array([x0, y0]) + off
-        dirs = pos / np.linalg.norm(pos, axis=1, keepdims=True)
-        v = dirs * v_r[:, None]
-    else:
-        v_t = vc * orbit * (1 - 0.3 * along) - side * 30.0
-        v = v_r[:, None] * ur + v_t[:, None] * ut + rng.normal(0, 6, (N, 2))
-        if burst is not None:
-            # 原地解体：恒星本来是静止的，剥下来的气体也几乎静止，只朝随便哪个方向轻轻飘一点，很快被阻力刹住，
-            # 在原地成实心的一团（都往外散会堆成外亮内空的“甜甜圈”）；之后交给引力和漩涡（SHARD_SIM_VS 的 u_orbit / u_swirl）
-            a = rng.uniform(0, 6.2832, N)
-            sp = rng.uniform(*burst, N)
-            v = np.stack([np.cos(a), np.sin(a)], 1) * sp[:, None]
+    off = np.stack([rad * np.cos(th), rad * np.sin(th)], 1) * R
+    v = np.zeros((N, 2))
+    if burst is not None:
+        # 恒星本来是静止的，剥下来的气体也几乎静止，只朝随便哪个方向轻轻飘一点，很快被阻力刹住，
+        # 在原地成实心的一团（都往外散会堆成外亮内空的“甜甜圈”）；之后交给引力和漩涡（SHARD_SIM_VS 的 u_orbit / u_swirl）
+        a = rng.uniform(0, 6.2832, N)
+        sp = rng.uniform(*burst, N)
+        v = np.stack([np.cos(a), np.sin(a)], 1) * sp[:, None]
     init = np.zeros((N, 8), 'f4')
     init[:, 0], init[:, 1], init[:, 2] = x0 + off[:, 0], y0 + off[:, 1], z0
     init[:, 3], init[:, 4] = v[:, 0], v[:, 1]
-    # 阻力倍数：撕开的气体没有“迸开”的那一下，阻力很小；原地解体往外迸的要很快刹住（像胶囊碎掉的晶尘）
+    # 阻力倍数：往外飘的要很快刹住（像胶囊碎掉的晶尘）
     init[:, 6], init[:, 7] = -1, (np.where(kind == GAS, 0.1, 0.2) if burst is None else 0.9)
     c = np.array([color.redF(), color.greenF(), color.blueF()])
     w = rng.uniform(0, 0.25, (N, 1))
@@ -139,7 +109,7 @@ class SimJob:
     def pump(self):
         """再提交几遍。"""
         sim, N = self.system.sim, self.N
-        for k, v in dict(u_dt=1 / SIM_HZ, u_G=self.g, u_RS=self.system.rs, u_KT=SHARD_KT, u_KR=SHARD_KR, u_orbit=self.orbit,
+        for k, v in dict(u_dt=1 / SIM_HZ, u_G=self.g, u_RS=self.system.rs, u_KT=SHARD_KT, u_orbit=self.orbit,
                          u_swirl=self.swirl, u_hold=self.hold).items():
             sim[k].value = v
         for p in range(self.p, min(self.passes, self.p + self.PASSES_PER_FRAME)):
@@ -213,7 +183,7 @@ class ShardSystem:
             b.tex.use(0)
             for k, v in dict(u_vp=(vw, vh), u_cam=(cam_c.x(), cam_c.y(), cam_s), u_bh=bh, u_t=now - b.t0,
                              u_dir=1.0 if b.forward else -1.0, u_hz=float(SIM_HZ), u_rs=float(self.rs), u_focal=float(self.focal),
-                             u_n=b.n, u_w=TEX_W, u_rec=0, u_time=now, u_streak=1.0 if b.streaks else 0.0).items():
+                             u_n=b.n, u_w=TEX_W, u_rec=0, u_time=now, u_streak=1.0 if b.streaks else 0.0, u_gas=GAS_K).items():
                 m = prog.get(k, None)
                 if m is not None:
                     m.value = v

@@ -5,7 +5,7 @@
 import math
 import numpy as np
 import moderngl
-from shaders import STREAM_SIM_VS, STREAM_VS, STREAM_FS
+from shaders import STREAM_SIM_VS, STREAM_VS, STREAM_FS, GAS_K
 
 MAX_STARS = 32            # 和着色器里的 MAXS 一致
 PER_STAR = 800            # 每颗恒星的粒子数（稀一点，像原来那样薄薄的一股）
@@ -100,7 +100,7 @@ class StreamSystem:
         prog = self.prog
         prog['u_star'].write(self.stars_for_draw.tobytes())
         prog['u_scol'].write(np.asarray(colors, 'f4').tobytes())
-        for k, v in dict(u_vp=(vw, vh), u_bh=(bh[0], bh[1], rs_px), u_roll=roll, u_alpha=alpha, u_disk=disk, u_time=t).items():
+        for k, v in dict(u_vp=(vw, vh), u_bh=(bh[0], bh[1], rs_px), u_roll=roll, u_alpha=alpha, u_disk=disk, u_time=t, u_gas=GAS_K).items():
             m = prog.get(k, None)
             if m is not None:
                 m.value = v
