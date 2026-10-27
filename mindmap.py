@@ -230,6 +230,7 @@ class Node:
     def __init__(self, key, kind):
         self.key, self.kind = key, kind
         self.hover = self.active = self.removing = False
+        self.act = self.act0 = self.act1 = 0.0   # 展开的程度 0~1：变大、变亮跟着飞过去的动画慢慢过渡（active 是一下子切换的）
         self.parent_key = None
         self.text = self.sub = ''
         self.color = QColor('white')
@@ -267,7 +268,7 @@ class Node:
 
     def grown(self):
         """展开的那颗恒星放大的倍数（其他节点是 1）。"""
-        return 1 + STAR_ACTIVE * self.active
+        return 1 + STAR_ACTIVE * self.act
 
     def set_content(self, text, sub, color, data):
         self.text, self.sub, self.color, self.data = text, sub, QColor(color), data
@@ -640,7 +641,7 @@ class MindMap(QWidget):
                 start, z0, lag = n.swallow
                 ts = lag * self.anim.dur / SWALLOW_S
                 dx, dy = n.drift(job['t0'] + ts)
-                n.gas_r = STAR_R * 1.1 * (1 + 0.12 * n.glow + STAR_ACTIVE * n.active)       # 和 _node_sprites 里星体的大小一致
+                n.gas_r = STAR_R * 1.1 * (1 + 0.12 * n.glow + STAR_ACTIVE * n.act)       # 和 _node_sprites 里星体的大小一致
                 a, b = debris(rng, n.color, start.x() + dx, start.y() + dy, z0, STAR_R * 1.1, C_TEAR_S, True, burst=C_BURST, seed=n.seed, spread=n.gas_r)
             else:
                 # 展开：在恒星自己的位置正着模拟一遍“被吞掉”，之后倒着放（气体汇过来，恒星原地成形）。
@@ -726,6 +727,7 @@ class MindMap(QWidget):
             node.parent_key = parent
             node.set_content(text, sub, color, data)
             node.active = (kind == 'year' and data == self.expanded)
+            node.act0, node.act1 = node.act, float(node.active)
             node.p0, node.p1 = QPointF(node.base), pos
             node.z0, node.z1 = node.z, z
             node.o0, node.o1 = node.opacity, 1.0
@@ -806,6 +808,7 @@ class MindMap(QWidget):
             else:
                 n.base = QPointF(lerp(n.p0.x(), n.p1.x(), k), lerp(n.p0.y(), n.p1.y(), k))
             n.z = lerp(n.z0, n.z1, t)
+            n.act = lerp(n.act0, n.act1, t)
             n.opacity = max(0.0, min(1.0, lerp(n.o0, n.o1, t)))
             if n.fresh and n.kind != 'year':
                 # 新出来的胶囊：从上级胶囊那里出发时完全透明，边走边慢慢显出来，差不多到位时才完全不透明
@@ -1182,7 +1185,7 @@ class MindMap(QWidget):
         for n in self.nodes.values():
             if n.opacity < 0.01:
                 continue
-            gl = max(n.glow, 1.0 if n.active else 0.0)
+            gl = max(n.glow, n.act)
             if n.kind == 'center':
                 if self.parts is not None:              # 碎片正往里掉得越多越亮
                     gl = max(gl, self.parts.near_hole(t))
@@ -1194,13 +1197,13 @@ class MindMap(QWidget):
                 holes.append((n.sx, n.sy, half, half) + _rgba(n.color) + (rs_px, gl, n.opacity, half,
                                                                          self.bh[3], self.bh[4], self.cine_ease(), 0))
             elif n.kind == 'year':
-                R = STAR_R * n.k * (1 + 0.12 * n.glow + STAR_ACTIVE * n.active) * (0.2 + 0.8 * n.form)
+                R = STAR_R * n.k * (1 + 0.12 * n.glow + STAR_ACTIVE * n.act) * (0.2 + 0.8 * n.form)
                 R *= 1 + 0.15 * n.flash
                 bright = 0.75 + 0.25 * max(-1, min(1, n.z / 140))
                 # 朝向黑洞（潮汐鼓出的那一侧）
                 ang = n.dang if n.removing else math.atan2(self.bh[1] - n.sy, self.bh[0] - n.sx)
                 # 透明度通道：星体半径换算到解体气体分布的半径（gas_r），解体的晶胞和气体的位置对得上
-                stars.append((n.sx, n.sy, R * 5, R * 5) + _rgba(n.color, R / (n.gas_r * n.k)) + (R, n.glow + 3 * n.flash, n.opacity * self._retreat(n), 1.0 if n.active else 0.0,
+                stars.append((n.sx, n.sy, R * 5, R * 5) + _rgba(n.color, R / (n.gas_r * n.k)) + (R, n.glow + 3 * n.flash, n.opacity * self._retreat(n), n.act,
                                                                                  n.seed, bright, n.tear, ang))
             else:
                 k = n.k * (1 + 0.06 * n.glow)
@@ -1359,7 +1362,7 @@ class MindMap(QWidget):
                 below = max(n.rpx * 1.5, n.rpx / 2.6 * DISK_OUT * math.sin(self.bh[3]) + 8)    # 放在吸积盘下面
                 ax, ay, k = n.sx, n.sy + below, n.k
             elif n.kind == 'year':
-                alpha = n.opacity * self._retreat(n) * (200 + 35 * max(float(n.active), n.glow)) / 255
+                alpha = n.opacity * self._retreat(n) * (200 + 35 * max(n.act, n.glow)) / 255
                 alpha *= 1 - smooth(0.0, 0.4, n.tear)       # 星体化开时年份跟着淡掉，别比星体留得久（残影）
                 ax, ay, k = n.sx, n.sy + STAR_R * 1.3 * n.k * n.grown(), n.k
             else:
@@ -1448,8 +1451,8 @@ class MindMap(QWidget):
                     n.d[i] = max(-MAX_PUSH, min(MAX_PUSH, n.d[i] + n.v[i] * dt))
                     if abs(n.d[i]) < 0.03 and abs(n.v[i]) < 0.03:
                         n.d[i] = n.v[i] = 0.0
-            # 悬停亮度慢慢过渡；拖着恒星到了黑洞跟前时黑洞也亮起来（松手就收进去）
-            want = 1.0 if n.hover or (n.kind == 'center' and capturing) else 0.0
+            # 悬停亮度慢慢过渡；黑洞悬停不亮（用户不要），只在拖着恒星到了它跟前时亮起来提示（松手就收进去）
+            want = (1.0 if capturing else 0.0) if n.kind == 'center' else (1.0 if n.hover else 0.0)
             if n.glow != want:
                 n.glow += (want - n.glow) * min(1.0, dt * 9)
                 if abs(n.glow - want) <= 0.005:
@@ -1457,7 +1460,7 @@ class MindMap(QWidget):
         self._busy = (self.anim.running or self.cam.running or 0.0 < self.link_fade < 1.0 or now - self._last_input < IDLE_AFTER
                       or self.cine != self._cine_target() or self._drag is not None or len(self.dust) > 0 or now - self._gulp_t < 1.8
                       or (self.parts is not None and self.parts.active(now))
-                      or any(n.v[0] or n.v[1] or n.glow != (1.0 if n.hover else 0.0)
+                      or any(n.v[0] or n.v[1] or n.glow != (1.0 if n.hover and n.kind != 'center' else 0.0)
                              for n in self.nodes.values()))
         self._advance_particles(now, raw_dt)
 
