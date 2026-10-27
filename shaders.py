@@ -2,6 +2,11 @@
 # 物质流、恒星解体的气体是很多颗很淡的粒子叠出来的。中间画布改成浮点（见 mindmap 的 HDR 部分）以前，每颗粒子边缘
 # 不到 1/255 的光会被舍掉；浮点画布全保留，整体会亮一些。乘这个系数，让整体亮度和以前调好的差不多（边缘更柔和）
 GAS_K = 0.8
+# 恒星解体时碎成的晶胞：气体分布半径里每单位多少格；每粒开始碎的时刻在 tear 的 0~GRAIN_SPAN 里均匀随机（剩下的是碎掉要多久）。
+# shards.grain_time 用同样的散列给每团气体定出发时刻，两边要一致
+GRAIN = 8.0
+GRAIN_SPAN = 0.6
+GRAIN_GO = 0.3           # 那粒碎到这一步（淡掉一小半）时，同一位置的气体才出发（早了气体会叠在完整的星面上，把花纹盖成一片纯色）
 NOISE = '''
 float hash(vec2 p){ p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
 float noise(vec2 p){ vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3. - 2. * f);
@@ -239,6 +244,9 @@ STAR_FS = '''
 #define STAR_EXPO 0.85
 #define PALE_K 0.8
 #define PALE_SAT 1.0
+#define GRAIN ''' + repr(GRAIN) + '''
+#define GRAIN_SPAN ''' + repr(GRAIN_SPAN) + '''
+#define GRAIN_GO ''' + repr(GRAIN_GO) + '''
 uniform float u_time;
 in vec2 v_local; flat in vec4 v_color; flat in vec4 v_p1; flat in vec4 v_p2;
 out vec4 f;
@@ -271,17 +279,29 @@ void main(){
     q -= dd * max(al, 0.0) * 0.08 / 1.08;                   // 潮汐：朝黑洞那半边轻轻鼓出来一点
     float r = length(q);
     float body = 1.0 - smoothstep(0.97, 1.02, r);
-    float keep = 1.0, rim = 0.0, body0 = body;              // body0：化开之前的星体范围（外圈柔光只画在它外面）
+    float keep = 1.0, body0 = body, glowk = body, ember = 0.0; // body0：化开之前的星体范围（外圈柔光只画在它外面）；glowk：还在发光的部分
     if (tear > 0.0){
-        // 原地解体：从外圈往里一层层蒸发，边缘不规则、发亮；剥下来的那一层就地变成粒子（shards.debris 按同样的顺序出发），
-        // 所以粒子是从星体上出来的，不是星体消失后凭空出现（展开时倒过来：粒子汇过来，星体从中心长出来）。
-        // 以前试过一道撕口扫过去（像月食，有残影）、到处冒洞（像奶牛斑、裂成好几片）、整颗一起变淡（和粒子接不上），都不好
-        float n = fbm(q * 3.0 + seed * 7.0);
-        // 还剩下的半径：刚开始蒸发时边缘很不规则（粒子出发也是半随机的），快没了时收成中间的一小团（展开时从中心长出来，不是从边上冒出来）
-        float edge = 1.02 - tear * 1.15 + (n - 0.5) * 0.4 * (1.0 - tear);
-        keep = 1.0 - smoothstep(edge - 0.05, edge + 0.01, r);
-        float de = (r - edge) / 0.05;
-        rim = exp(-de * de) * body * (1.0 - smoothstep(0.75, 1.0, tear));
+        // 原地解体：整颗星体同时碎成颗粒。表面切成很多小晶胞，每个晶胞在随机的时刻（整颗范围内均匀，不分里外）
+        // 亮一下、和旁边裂开、缩成一粒消失；shards.grain_time 用同一个散列算出每团气体所在的晶胞，让它在晶胞碎掉的那一刻出发，
+        // 所以星体是一粒粒变成了这些气体（展开倒放：气体落回来，星体一粒粒填满）。
+        // 以前试过一道撕口扫过去（像月食，有残影）、到处冒大洞（像奶牛斑）、整颗一起变淡（和粒子接不上）、从外往里蒸发（最后剩个小点）
+        vec2 g = q0 * (v_color.a > 0.0 ? v_color.a : 1.0) * GRAIN + seed * 37.0;      // v_color.a：换算到气体分布的半径
+        vec2 gi = floor(g), gf = fract(g);
+        float d1 = 9.0, hc = 0.0;
+        for (int x = -1; x <= 1; x++) for (int y = -1; y <= 1; y++){
+            vec2 o = vec2(x, y); vec3 hh = h33(vec3(gi + o, seed * 11.0));
+            vec2 rr = o + hh.xy * 0.8 + 0.1 - gf; float d = dot(rr, rr);
+            if (d < d1){ d1 = d; hc = hh.z; }
+        }
+        float p = clamp((tear - hc * GRAIN_SPAN) / (1.0 - GRAIN_SPAN), 0.0, 1.0);      // 这一粒碎到哪了
+        // 碎开的那粒和旁边裂开、缩小、淡掉（颜色和挡光一起退，花纹一直留到这粒消失）；同一位置的气体在它淡到一半时出发、淡入接上。
+        // 试过先变成半透明的光再暗掉、碎开时发烫变亮：亮光叠在背景上比星面还亮、偏蓝，格子一多花纹就冲成了一片纯色
+        float size = mix(1.4, 0.4, smoothstep(0.0, 1.0, p));
+        float shape = 1.0 - smoothstep(size - 0.15, size, sqrt(d1));
+        keep = shape * (1.0 - smoothstep(0.0, 0.7, p));
+        glowk = keep * body;
+        // 碎掉的地方留一层淡淡的余光，跟着整颗化开退掉（只有气体接着的话，那一格比旁边暗一截，看着像个洞）
+        ember = (body - glowk) * 0.3 * (1.0 - smoothstep(0.4, 1.0, tear));
         body *= keep;
     }
     vec3 surf = vec3(0.0);
@@ -329,11 +349,12 @@ void main(){
     em *= 1.0 - smoothstep(3.2, 4.9, max(abs(q0.x), abs(q0.y)));      // 画到方块边缘前淡掉
     // 一开始撕，外面的柔光就很快没了：柔光照亮了周围的星空，撕掉的那块没有柔光，对比起来像个跟着星体走的暗洞（残影）
     em *= exp(-tear * 12.0);
-    vec3 col = surf * body * (0.85 + 0.25 * lift) + em * (1.0 - body0) + mix(c, vec3(1.0, 0.95, 0.85), 0.5) * rim * 1.6;
+    vec3 col = surf * (glowk + ember) * (0.85 + 0.25 * lift) + em * (1.0 - body0);
     col = 1.0 - exp(-col * 1.25);
-    float shade = act * 0.45 * exp(-o * 1.3) * (1.0 - smoothstep(2.6, 4.6, max(abs(q0.x), abs(q0.y))));
+    // 暗影只压在星体外面，跟着星体化开淡掉（不然星体碎掉后原地留一块暗斑）
+    float shade = act * 0.45 * exp(-o * 1.3) * (1.0 - smoothstep(2.6, 4.6, max(abs(q0.x), abs(q0.y)))) * (1.0 - tear);
     // 散到一半的地方主要是发光、不怎么挡后面（不然半透明的残块会显成暗灰的斑）
-    f = vec4(col * op, (body * keep + (1.0 - body) * shade) * op);
+    f = vec4(col * op, (body * keep + (1.0 - body0) * shade) * op);
 }
 '''
 
@@ -610,7 +631,7 @@ uniform int u_pass;
 uniform float u_G, u_RS, u_KT;
 uniform float u_orbit;    // 漩涡：绕黑洞走的速度慢慢被带到圆轨道速度的这几成（0 = 没有漩涡）
 uniform float u_swirl;    // 漩涡带起来的快慢（每秒）：粒子从星体上离开时几乎静止，被吸进去的路上越转越快
-uniform float u_hold;     // 刚剥下来的这么多秒里先不受引力（展开倒放时 = 气体先汇到、停在原地，恒星再从里面凝出来）
+uniform float u_hold;     // 碎下来后的这么多秒里先不受引力（展开倒放时 = 气体先汇到、停在原地，再落回星体上）
 in vec4 in_a;             // x, y, z, 速度 x
 in vec4 in_b;             // 速度 y, 已过时间, 第几步掉进视界（-1 = 还没有）, 阻力倍数
 out vec4 out_a; out vec4 out_b;
@@ -621,6 +642,9 @@ void main(){
     float age = in_b.y, done = in_b.z, drag = in_b.w;
     vec4 rec[8];
     for (int s = 0; s < 8; s++){
+        if (age < 0.0){                       // 还没从星体上碎下来（初始的已过时间是负的）：待在原地
+            age += u_dt; rec[s] = vec4(p, 0.0); continue;
+        }
         float r = length(p.xy) + 1e-3;
         vec2 u = -p.xy / r;
         float m = max(r, u_RS * 1.2);

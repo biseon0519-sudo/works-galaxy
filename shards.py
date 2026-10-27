@@ -4,7 +4,7 @@
 import math
 import numpy as np
 import moderngl
-from shaders import SHARD_SIM_VS, SHARD_VS, SHARD_FS, GAS_K
+from shaders import SHARD_SIM_VS, SHARD_VS, SHARD_FS, GAS_K, GRAIN, GRAIN_SPAN, GRAIN_GO
 
 SIM_HZ = 120              # 模拟、记录路线的步长（每秒多少步）
 SIM_STEPS = 7 * SIM_HZ    # 最多模拟 7 秒（没掉进去的气体 FADE_AT 秒后淡掉）
@@ -27,9 +27,36 @@ def life_steps(look, done):
     return np.where(look[:, 6] == CLOUD, int(CLOUD_S * SIM_HZ), steps)
 
 
-def debris(rng, color, x0, y0, z0, R, tear_s=0.0, extras=True, burst=None):
+def _h33(p):
+    """和 STAR_FS 里的 h33 一样的散列（float32，结果和显卡上只差最后几位）。"""
+    p = np.asarray(p, 'f4')
+    p = (p * np.array([0.1031, 0.1030, 0.0973], 'f4')) % 1
+    p = p + np.sum(p * (p[:, [1, 0, 2]] + np.float32(33.33)), 1, keepdims=True)
+    return ((p[:, [0, 0, 1]] + p[:, [1, 0, 0]]) * p[:, [2, 1, 0]]) % 1
+
+
+def grain_time(u, seed):
+    """u：气体在星体上的位置（以气体分布的半径为 1）。返回它所在的晶胞碎开的时刻（tear 的 0~1），
+    和 STAR_FS 里解体的晶胞一一对应：那一粒裂开、缩小的时候，这团气体从那里出发。"""
+    g = u.astype('f4') * np.float32(GRAIN) + np.float32(seed * 37.0)
+    gi = np.floor(g); gf = g - gi
+    best, hc = np.full(len(u), 9.0, 'f4'), np.zeros(len(u), 'f4')
+    for x in (-1, 0, 1):
+        for y in (-1, 0, 1):
+            o = np.array([x, y], 'f4')
+            hh = _h33(np.concatenate([gi + o, np.full((len(u), 1), seed * 11.0, 'f4')], 1))
+            rr = o + hh[:, :2] * np.float32(0.8) + np.float32(0.1) - gf
+            d = np.sum(rr * rr, 1)
+            better = d < best
+            best[better], hc[better] = d[better], hh[better, 2]
+    # 那粒淡掉一些以后才出发（气体叠在完整的星面上会把花纹盖成一片纯色），淡入的 0.1 秒和那粒淡掉的时间叠在一起
+    return hc * GRAIN_SPAN + GRAIN_GO * (1 - GRAIN_SPAN)
+
+
+def debris(rng, color, x0, y0, z0, R, tear_s=0.0, extras=True, burst=None, seed=0.0, spread=None):
     """一颗半径 R 的恒星在世界坐标 (x0, y0, z0) 原地解体时化成的气体。
-    tear_s：星体从外往里蒸发完要多久，每团气体等蒸发到它那一层才出现。extras：要不要残留气云。
+    tear_s：星体碎完要多久，每团气体等它所在的那粒碎开时才出发（grain_time；seed 是恒星的随机数，和 STAR_FS 一致）。
+    extras：要不要残留气云。spread：气体铺在多大的圆里（默认 R；展开那颗恒星画得大，铺开的范围跟着大，每团只稍微大一点，不然叠成一大团过亮的雾）。
     burst：(最小, 最大) 解体时朝各个方向轻轻飘开的速度（收起用）；None 是从静止开始（展开用：倒着放时气体汇到恒星那一刻正好停住）。
     返回 (模拟的初始状态 (N, 8)，画用的参数 (N, 16))；画用参数里的编号、开始时间、步数之后再填。"""
     ng, ns, nc = PER_STAR
@@ -39,7 +66,9 @@ def debris(rng, color, x0, y0, z0, R, tear_s=0.0, extras=True, burst=None):
     kind = np.repeat([GAS, SPARK, CLOUD], [ng, ns, nc])
     rad, th = np.sqrt(rng.random(N)), rng.uniform(0, 6.2832, N)               # 铺满整个恒星
     rad[kind == CLOUD] *= 0.5                                                 # 气云挤在中间
-    off = np.stack([rad * np.cos(th), rad * np.sin(th)], 1) * R
+    spread = spread or R
+    off = np.stack([rad * np.cos(th), rad * np.sin(th)], 1) * spread
+    R = R * (spread / R) ** 0.5
     v = np.zeros((N, 2))
     if burst is not None:
         # 恒星本来是静止的，剥下来的气体也几乎静止，只朝随便哪个方向轻轻飘一点，很快被阻力刹住，
@@ -61,9 +90,10 @@ def debris(rng, color, x0, y0, z0, R, tear_s=0.0, extras=True, burst=None):
                            rng.uniform(0.5, 1.3, N))
     look[:, 8:11] = c * (1 - w) + w
     look[:, 11] = rng.random(N)
-    # 什么时候从星体上剥下来：大体上外圈先走（STAR_FS 里星体也是从外往里、边缘不规则地蒸发），一半按层、一半随机，
-    # 这样粒子是从星体刚消失的地方出发的，又不会一层层分得太清楚、堆成“甜甜圈”
-    look[:, 12] = np.clip((1 - rad) * 0.6 + rng.uniform(0, 0.4, N), 0, 1) * tear_s
+    # 什么时候从星体上碎下来：它所在的那粒晶胞碎开的时刻（整颗星体各处随机，不分里外）。
+    # 在那之前它待在原地不动（模拟的初始已过时间是负的，见 SHARD_SIM_VS）
+    look[:, 12] = grain_time(off / spread, seed) * tear_s
+    init[:, 5] = -look[:, 12]
     look[kind == CLOUD, 12] = tear_s * 0.3                                    # 气云在撕到一半时冒出来
     look[:, 13], look[:, 15] = 1.0, 3.0                                       # 亮点的亮度、慢慢变暗的快慢
     return init, look
