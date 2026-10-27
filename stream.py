@@ -13,7 +13,7 @@ SPARK_SHARE = 0.4         # 其中亮点的比例（其余是薄薄的发光气�
 LIFE = 40.0               # 一颗粒子最多飞多久（秒），到了就回去重新出发
 SIM_HZ = 120              # 每秒最多算几步
 V_FLOW = 28.0             # 流速（像素/秒）：慢悠悠的，靠近黑洞稍微快一点
-V_DISK = 60.0             # 在吸积盘外缘绕的速度（像素/秒），越往里越快
+V_DISK_MAP, V_DISK_CINE = 25.0, 60.0   # 在吸积盘外缘绕的速度（像素/秒），越往里越快。全图里黑洞小，60 绕得太快（用户嫌转得快）
 CAP_MAP, CAP_CINE = 9.0, 4.0          # 从离黑洞多远（视界半径）开始被盘接住：近景里恒星本来就离黑洞只有五个视界半径，要近一些才接
 PREWARM_S = 24.0          # 重新开始时先快进多少秒，物质流一出现就是完整的（流得慢，要快进得久一点）
 PREWARM_DT = 1 / 30       # 快进的步长
@@ -81,7 +81,7 @@ class StreamSystem:
         sim['u_star'].write(stars.tobytes())
         sim['u_svel'].write(vel.tobytes())
         for k, v in dict(u_life=LIFE, u_n=(0.0, math.cos(el), -math.sin(el)), u_rspx=rs_px, u_vflow=V_FLOW,
-                         u_vdisk=V_DISK, u_cap=CAP_MAP + (CAP_CINE - CAP_MAP) * cine).items():
+                         u_vdisk=V_DISK_MAP + (V_DISK_CINE - V_DISK_MAP) * cine, u_cap=CAP_MAP + (CAP_CINE - CAP_MAP) * cine).items():
             sim[k].value = v
         if reset:
             self.need_reset = False

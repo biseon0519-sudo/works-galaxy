@@ -4,7 +4,7 @@
 GAS_K = 0.8
 # HDR 高光强度（只在 HDR 屏上有，加在 SDR 画面之上；线性，1 = 再亮一个 SDR 白色）。总上限见 mindmap.HDR_PEAK
 # HL_DISK：盘在 SDR 里亮过 HL_DISK_KNEE（色调映射前）的部分接着往上亮；HL_GLOW：黑洞高光晕开的柔光（mindmap 里另做一遍辉光）
-HL = dict(HL_DISK=0.6, HL_DISK_SOFT=1.0, HL_DISK_KNEE=1.0, HL_GLOW=1.2, HL_RING=1.5, HL_GULP=1.5, HL_CORE=0.8, HL_SURF=0.5, HL_SURF_POW=2.0, HL_EDGE=1.5, HL_FLASH=1.2, HL_SPARK=2.0, HL_GAS=0.8,
+HL = dict(HL_DISK=0.6, HL_DISK_SOFT=1.0, HL_DISK_KNEE=1.0, HL_GLOW=1.2, HL_RING=1.5, HL_GULP=1.5, HL_CORE=0.8, HL_SURF=0.5, HL_SURF_POW=2.0, HL_EDGE=1.5, HL_RIM=0.8, HL_FLASH=1.2, HL_SPARK=2.0, HL_GAS=0.8,
           HL_STAR=2.5)
 import os as _os      # 调参用：环境变量 HL_DISK=… 临时覆盖（不改代码）
 HL.update({k: float(_os.environ[k]) for k in HL if k in _os.environ})
@@ -332,6 +332,9 @@ STAR_FS = '''
 #define STAR_EXPO 0.85
 #define PALE_K 0.8
 #define PALE_SAT 1.0
+#ifndef RIM_K
+#define RIM_K 0.9
+#endif
 #define GRAIN ''' + repr(GRAIN) + '''
 #define GRAIN_SPAN ''' + repr(GRAIN_SPAN) + '''
 #define GRAIN_GO ''' + repr(GRAIN_GO) + '''
@@ -393,9 +396,13 @@ void main(){
         body *= keep;
     }
     vec3 surf = vec3(0.0);
+    float rim = 0.0;
     if (r < 1.03){
         float mu = sqrt(max(0.0, 1.0 - r * r));
         vec3 nrm = vec3(q.x, -q.y, mu);
+        // 身后巨大的吸积盘照过来：朝黑洞那侧的边缘一道暖色亮边（光从黑洞方向、稍微从后面来，只亮在边上，不盖住花纹）
+        float lit = max(dot(nrm, normalize(vec3(dd.x, -dd.y, -0.35))), 0.0);
+        rim = smoothstep(0.0, 0.9, lit) * pow(1.0 - mu, 1.2);
         // 自转：绕稍微歪一点的轴慢慢转，黑子会从一边转到另一边
         float tilt = 0.35 * (seed - 0.5), spin = t * 0.05 + seed * 6.283;
         nrm = vec3(nrm.x, nrm.y * cos(tilt) - nrm.z * sin(tilt), nrm.y * sin(tilt) + nrm.z * cos(tilt));
@@ -438,7 +445,12 @@ void main(){
     // 一开始撕，外面的柔光就很快没了：柔光照亮了周围的星空，撕掉的那块没有柔光，对比起来像个跟着星体走的暗洞（残影）
     em *= exp(-tear * 12.0);
     vec3 sface = surf * (glowk + ember) * (0.85 + 0.25 * lift);
-    vec3 col = sface + em * (1.0 - body0);
+    // 只有展开的那颗（离黑洞近、在盘的光里）。星面本来就接近白，光往上加看不出来：边上往暖橙色染，外面朝黑洞那侧再贴一圈窄窄的暖光
+    float rk = rim * RIM_K * act * glowk;
+    vec3 rimc = vec3(1.0, 0.66, 0.4) * rk;
+    float side = smoothstep(0.0, 1.0, max(dot(dir, dd), 0.0));
+    em += vec3(1.0, 0.62, 0.36) * exp(-o * 9.0) * side * RIM_K * act * 0.9 * (1.0 - smoothstep(0.0, 0.3, tear));
+    vec3 col = sface * (1.0 - 0.45 * rk) + rimc + em * (1.0 - body0);
     col = 1.0 - exp(-col * 1.25);
     // 暗影只压在星体外面，跟着星体化开淡掉（不然星体碎掉后原地留一块暗斑）
     float shade = act * 0.45 * exp(-o * 1.3) * (1.0 - smoothstep(2.6, 4.6, max(abs(q0.x), abs(q0.y)))) * (1.0 - tear);
@@ -448,7 +460,7 @@ void main(){
     vec3 whiteHot = mix(c, vec3(1.0, 0.97, 0.92), 0.7);
     // HDR：整个星面按自己的明暗再亮一截（花纹保留，不是一块白），中心更亮；日珥、色球层的亮边也亮出来
     hl = ((HL_CORE * exp(-r * r * 3.0) * glowk + HL_FLASH * flashH * (glowk + exp(-o * 3.0) * (1.0 - body0) * 0.5)) * whiteHot
-          + HL_SURF * pow(max(sface, 0.0), vec3(HL_SURF_POW)) * body * keep      // 越亮的地方提得越多，花纹的明暗拉开（同比例提亮再被上限压回来会发糊）
+          + HL_SURF * pow(max(sface, 0.0), vec3(HL_SURF_POW)) * body * keep + HL_RIM * rimc      // 越亮的地方提得越多，花纹的明暗拉开（同比例提亮再被上限压回来会发糊）
           + HL_EDGE * mix(c, vec3(1.0, 0.42, 0.22), 0.55) * (prom * 1.4 + chrom * 0.8) * lift * (1.0 - body0) * exp(-tear * 12.0)) * op;   // 和上面的柔光一样一碎开就消失，不然原地留一圈亮环
 }
 '''
