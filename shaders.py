@@ -4,7 +4,7 @@
 GAS_K = 0.8
 # HDR 高光强度（只在 HDR 屏上有，加在 SDR 画面之上；线性，1 = 再亮一个 SDR 白色）。总上限见 mindmap.HDR_PEAK
 # HL_DISK：盘在 SDR 里亮过 HL_DISK_KNEE（色调映射前）的部分接着往上亮；HL_GLOW：黑洞高光晕开的柔光（mindmap 里另做一遍辉光）
-HL = dict(HL_DISK=0.6, HL_DISK_SOFT=1.0, HL_DISK_KNEE=1.0, HL_GLOW=1.2, HL_RING=1.5, HL_GULP=1.5, HL_CORE=0.8, HL_SURF=0.5, HL_SURF_POW=2.0, HL_EDGE=1.5, HL_RIM=0.8, HL_FLASH=1.2, HL_SPARK=2.0, HL_GAS=0.8,
+HL = dict(HL_DISK=0.6, HL_DISK_SOFT=1.0, HL_DISK_KNEE=1.0, HL_GLOW=1.2, HL_RING=1.5, HL_GULP=1.5, HL_CORE=0.8, HL_SURF=0.5, HL_SURF_POW=2.0, HL_EDGE=1.5, HL_RIM=0.8, HL_TEXT=0.8, HL_FLASH=1.2, HL_SPARK=2.0, HL_GAS=0.8,
           HL_STAR=2.5)
 import os as _os      # 调参用：环境变量 HL_DISK=… 临时覆盖（不改代码）
 HL.update({k: float(_os.environ[k]) for k in HL if k in _os.environ})
@@ -332,6 +332,9 @@ STAR_FS = '''
 #define STAR_EXPO 0.85
 #define PALE_K 0.8
 #define PALE_SAT 1.0
+#ifndef STAR_SPIN
+#define STAR_SPIN 0.1
+#endif
 #ifndef RIM_K
 #define RIM_K 0.9
 #endif
@@ -404,7 +407,7 @@ void main(){
         float lit = max(dot(nrm, normalize(vec3(dd.x, -dd.y, -0.35))), 0.0);
         rim = smoothstep(0.0, 0.9, lit) * pow(1.0 - mu, 1.2);
         // 自转：绕稍微歪一点的轴慢慢转，黑子会从一边转到另一边
-        float tilt = 0.35 * (seed - 0.5), spin = t * 0.05 + seed * 6.283;
+        float tilt = 0.35 * (seed - 0.5), spin = t * STAR_SPIN * (0.8 + 0.4 * seed) + seed * 6.283;   // 以前 0.05：两分钟才转一圈，看不出在转
         nrm = vec3(nrm.x, nrm.y * cos(tilt) - nrm.z * sin(tilt), nrm.y * sin(tilt) + nrm.z * cos(tilt));
         vec3 s = vec3(nrm.x * cos(spin) + nrm.z * sin(spin), nrm.y, -nrm.x * sin(spin) + nrm.z * cos(spin));
         // 等离子：扭曲过的噪声，亮的细丝 + 暗一点的团块，慢慢流动；底下再叠一层很细的米粒
@@ -617,14 +620,22 @@ void spawn(inout vec3 p, inout vec3 v, float seed, float gen, vec4 st, vec2 sv){
     vec2 aim = -p.xy / max(length(p.xy), 1e-3);
     v = vec3(sv + aim * u_vflow / u_rspx * (0.4 + 0.4 * h2), -p.z * 0.2);
 }
+// 一颗粒子从出发到掉进去大约多久：流到盘边（按 u_vflow）+ 在盘里一边绕一边往里旋（径向速度约是绕的速度的 1/4）
+float cycle(vec4 st){
+    float trip = length(st.xy) * u_rspx / u_vflow;
+    float cap = min(u_cap, length(st.xy));
+    float orbit = 4.0 * u_rspx / u_vdisk / sqrt(6.2) * (2.0 / 3.0) * max(pow(cap, 1.5) - 2.83, 0.0);
+    return min(trip + orbit, u_life);
+}
 void main(){
     vec3 p = in_a.xyz, v = in_b.xyz;
     float age = in_a.w, gen = in_b.w, seed = in_c.y;
     int o = int(in_c.x);
     vec4 st = u_star[o];
-    if (u_reset > 0.5){                                       // 重新开始：出发时间在“流过去要多久”里错开，快进完就是匀匀的一股
-        float trip = length(st.xy) * u_rspx / u_vflow;
-        age = -hsh(seed * 9.7 + gen) * min(trip, u_life); gen += 1.0; v = vec3(0.0);
+    if (u_reset > 0.5){
+        // 重新开始：出发时间在整个周期（流过去 + 在盘里绕到掉进去）里错开。以前只在“流过去”那段里错开，
+        // 全图里粒子在盘里还要绕很久，结果一批出发、全都还在绕、空一段、再一批（用户看到一段一段的）
+        age = -hsh(seed * 9.7 + gen) * cycle(st); gen += 1.0; v = vec3(0.0);
     }
     for (int s = 0; s < u_steps; s++){
         if (age < 0.0){                                       // 还没出发
@@ -659,9 +670,9 @@ void main(){
         v += acc * u_dt;
         p += v * u_dt;
         age += u_dt;
-        if (length(p) < 2.0 || age > u_life){                 // 掉进去了（或太久）：回到恒星重新出发
-            gen += 1.0;
-            if (st.w > 0.5){ spawn(p, v, seed, gen, st, u_svel[o]); age = 0.0; }
+        if (length(p) < 2.0 || age > u_life){                 // 掉进去了（或太久）：回到恒星，等一小段随机的时间再出发
+            gen += 1.0;                                       // （每轮都打乱一点，就算周期估得不准，几轮以后出发时间也会匀开）
+            if (st.w > 0.5) age = -hsh(seed * 2.3 + gen * 1.9) * 0.3 * cycle(st);
             else age = -0.2 - hsh(seed + gen) * clamp(length(st.xy) * u_rspx / u_vflow, 1.0, u_life);   // 恒星不在：等它出现，出发时间错开
         }
     }
@@ -938,6 +949,7 @@ out vec4 f;
 void main(){
     vec2 uv = mix(v_color.xy, v_color.zw, v_local / v_p1.yz * 0.5 + 0.5);    // v_color 借来放图集里的位置
     f = texture(u_atlas, uv) * v_p1.x;
+    hl = f.rgb * f.rgb * HL_TEXT;          // HDR：文字比白色亮一截，更好认（大约换成线性再按比例加；辉光在写字之前取，字不会发光）
 }
 '''
 LABEL_FS = with_hl(LABEL_FS.replace('#version 330', '#version 330\n' + HL_DEFS, 1))

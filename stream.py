@@ -75,6 +75,9 @@ class StreamSystem:
             lim = 4 * V_FLOW / rs_px                                    # 换视角、跳位置时别把粒子甩飞
             sp = np.hypot(vel[:, 0], vel[:, 1])[:, None]
             vel *= np.minimum(1.0, lim / np.maximum(sp, 1e-6))
+            # 展开的近景里恒星本身不动，看起来的移动只来自黑洞跟着鼠标的视差（物质流以黑洞为中心算）：不让粒子继承，
+            # 不然晃鼠标会把流甩成一团一团的。全图里拖恒星时照常甩出弯
+            vel *= 1.0 - cine
         self.prev = stars.copy()
         self.view = ((0.0, math.cos(el), -math.sin(el)), DISK_OUT_MAP + (DISK_OUT_CINE - DISK_OUT_MAP) * cine)
         sim = self.sim
