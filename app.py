@@ -13,7 +13,7 @@ from widgets import EditDialog
 from mindmap import MindMap
 from fluent_ui import make_app, Window, show_window, single_instance
 
-VERSION = '2026.10.26'                    # 日历版本号：发布当天的日期，同一天再发就加 .1、.2
+VERSION = '2026.10.27'                    # 日历版本号：发布当天的日期，同一天再发就加 .1、.2
 ACCENT = '#29c4f6'                        # 导图是深色霓虹风，界面固定用深色 + 青色主题色
 
 

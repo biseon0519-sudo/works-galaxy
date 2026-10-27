@@ -33,6 +33,7 @@ RS = 34                   # 全图时黑洞阴影（看到的黑色圆）的半�
 # 恒星生成（随机排布、单颗吐出来）时的避让：离黑洞中心至少多远、恒星之间至少多远（世界坐标；吸积盘外缘约 81，以前最近 150，看着贴在盘边上）
 STAR_MIN_R = 230
 STAR_GAP = 125
+STAR_AREA = 12500         # 随机排布时每颗恒星平均占多大地方（决定整体范围：最远约 √(STAR_MIN_R² + 颗数·STAR_AREA)）
 EL_MAP, EL_CINE = 0.22, 0.10          # 黑洞仰角（弧度）：全图稍微斜着看；展开时几乎侧视，像飞船飞到黑洞旁边
 # 展开时黑洞很大、偏左上、一部分在画面外，像坐飞船飞到了黑洞边上（用户自己调出来的位置）：
 # 中心位置（占宽、高的比例）、阴影半径（占高度的比例）
@@ -45,6 +46,10 @@ CINE_STAR_X = 0.34        # 展开时恒星的位置（占宽度）：在黑洞�
 DISK_OUT = 6.2            # 吸积盘外缘（以视界半径为单位，和着色器里的 R_OUT 一致）
 ANIM_S, CAM_S = 1.1, 1.1  # 动画时长（秒）：普通移动、镜头（展开时恒星重建的时长按模拟出来的算）
 PILL_FADE = (0.0, 0.7)    # 新胶囊在动画的哪一段（按时间 0~1）从透明淡入到不透明
+STAR_SETTLE_S = 0.8       # 点恒星展开时，分支胶囊等恒星（和镜头）差不多停稳了，再从恒星停下的位置长出来
+EXPAND_SLOW = 2.0         # 点恒星展开时恒星、镜头走得比普通移动慢多少倍（胶囊等待也跟着拉长，胶囊自己长出来的速度不变）
+# 那时恒星、镜头起步更柔：时间先按 1.5 次方放慢再进 ease_spring（默认起步太猛；直接把 w 调小起步是柔了，但结尾停不稳、会一下刹住）
+EXPAND_SOFT = 1.5
 # 收起：恒星原地解体（亮一下，整颗同时碎成一粒粒气体），碎下来的气体轻轻飘开、
 # 很快被刹住，再被黑洞吸进去。引力弱一些、绕黑洞走得快一些，所以是绕着黑洞慢慢旋进去（用户要的拉扯感、不用收得太利索）。
 # 气体在显卡上整段模拟（见 shards.py）。差不多吞完时黑洞亮一下、荡开一圈涟漪
@@ -111,8 +116,9 @@ def spiral_points(n, r0=175.0, gap=135.0, grow=46.0):
 
 
 def star_layout(years, seed):
-    """恒星的自动位置 {年: (角度, 半径, z)}：沿一条从黑洞旋出去的螺旋按时间排，最早的离黑洞最近，每颗带一点随机偏移和远近。
-    seed 决定螺旋的松紧、朝向和偏移，换一个 seed 就是一种新排布；seed 为 None 是最早的固定排布（兼容以前拖过的位置）。"""
+    """恒星的自动位置 {年: (角度, 半径, z)}：按时间顺序绕黑洞排一圈（和吸积盘同向），每颗离黑洞多远各自随机，
+    参差不齐（用户不要旋臂那样越晚越远：可以 13 年远、14 年近，也可以连着几颗都远或都近）。
+    seed 决定朝向、远近和偏移，换一个 seed 就是一种新排布；seed 为 None 是最早的固定排布（兼容以前拖过的位置）。"""
     n = max(1, len(years))
     out = {}
     if seed is None:
@@ -124,12 +130,12 @@ def star_layout(years, seed):
             out[y] = (a, max(STAR_MIN_R, rr), r.uniform(-140, 140))
         return out
     r = random.Random(f'layout{seed}')
-    pts = spiral_points(n, r0=r.uniform(160, 205), gap=r.uniform(122, 150), grow=r.uniform(32, 62))
-    turn = r.uniform(-math.pi, math.pi)
+    rmax = math.sqrt(STAR_MIN_R ** 2 + n * STAR_AREA)       # 整体范围和以前的旋臂差不多大
+    turn, step = r.uniform(-math.pi, math.pi), 2 * math.pi / n
     xy = []
     for i in range(n):
-        a, rr = pts[i]
-        a += turn + r.uniform(-0.16, 0.16); rr *= r.uniform(0.9, 1.1)
+        a = turn - (i + r.uniform(-0.3, 0.3)) * step
+        rr = r.uniform(STAR_MIN_R, rmax)
         xy.append([rr * math.cos(a), rr * math.sin(a)])
     # 随机偏移可能让两颗挨得太近（叠在一起）或离黑洞太近：反复把太近的两颗各推开一半、把太靠里的沿半径推出去
     for _ in range(80):
@@ -177,15 +183,21 @@ def ease_spring(t, w=6.5):
     return (1 - (1 + w * t) * math.exp(-w * t)) / (1 - (1 + w) * math.exp(-w))
 
 
+def ease(t, soft=1.0):
+    """缓动：ease_spring，soft > 1 时起步更柔（时间先按 soft 次方放慢），结尾一样慢慢停稳。"""
+    return ease_spring(t ** soft if soft != 1.0 else t)
+
+
 class Tween:
     """按真实时间算进度的补间：每帧画之前按当前时间取值，和屏幕刷新同步。
     （QVariantAnimation 按自己的定时器跳，和 120Hz 的画面对不齐，看起来一顿一顿的、发硬）"""
 
     def __init__(self):
-        self.t0, self.dur, self.running = 0.0, 1.0, False
+        self.t0, self.dur, self.running, self.soft = 0.0, 1.0, False, 1.0
 
-    def start(self, now, dur):
-        self.t0, self.dur, self.running = now, dur, True
+    def start(self, now, dur, soft=1.0):
+        """soft：起步放柔（时间先按这个次方放慢，见 ease），1 = 不放。"""
+        self.t0, self.dur, self.running, self.soft = now, dur, True, soft
 
     def stop(self):
         self.running = False
@@ -243,6 +255,8 @@ class Node:
         self.form = 1.0                 # 恒星凝结的程度 0~1
         self.flash = 0.0                # 解体前、凝结时亮一下
         self.tear = 0.0                 # 化开了多少 0~1（收起时原地化开；展开时倒过来，气体汇成星体）
+        self.lag = 0.0                  # 动画开始后等几秒才开始动（展开时的分支胶囊等恒星停稳）
+        self.span = 0.0                 # 自己走多久（秒；0 = 和这次动画里其他节点一样）
         self.gas_r = STAR_R * 1.1       # 解体的气体铺在多大的圆里（世界坐标；展开那颗画得大，要跟着大）
 
     def round(self):
@@ -347,6 +361,9 @@ class MindMap(QOpenGLWidget):
         self._last_input = 0.0          # 上次鼠标操作的时间
         self.link_fade = 1.0            # 连线整体的显示程度：展开、收起时先隐藏，快停稳时再淡入
         self._keep_links = False        # 这次排布只是单独收进去 / 吐出来一颗：别的恒星的物质流照常，不整体隐藏
+        self._pill_wait = 0.0           # 下一次排布里新出来的胶囊等几秒（点恒星展开时）
+        self._span_base = 0.0           # 这次动画里节点默认走多久（0 = 整个动画的时长）
+        self._slow = 1.0                # 下一次排布、镜头慢几倍（点恒星展开时）
         self._anim_moving = False       # 这次动画里有没有东西在飞（只是淡入淡出就不用藏连线）
         # 晶尘粒子，每行：世界 x、y，速度 x、y，剩余寿命，总寿命，大小，颜色 r、g、b，闪烁相位
         self.dust = np.zeros((0, 11), 'f4')
@@ -388,9 +405,12 @@ class MindMap(QOpenGLWidget):
 
     def expand(self, year):
         self.root_open = True
+        self._slow = EXPAND_SLOW if year != self.expanded else 1.0
+        self._pill_wait = STAR_SETTLE_S * self._slow if year != self.expanded else 0.0
         self.expanded = year
         self.relayout()
         self.fit()
+        self._slow = 1.0
 
     def collapse(self):
         self.expanded = None
@@ -476,7 +496,7 @@ class MindMap(QOpenGLWidget):
         doc = self.doc
         years = sorted(doc['years'])
         n = max(1, len(years))
-        # 旋臂：按时间顺序沿一条从黑洞旋出去的螺旋排，最早的离黑洞最近；每颗带一点随机偏移和远近
+        # 按时间顺序绕黑洞排一圈，每颗离黑洞多远各自随机（见 star_layout）；每颗带一点随机偏移和远近
         lay = star_layout(years, doc.get('layout_seed'))
         custom = doc.get('star_pos', {})        # 用户拖过的恒星：相对自动位置的偏移（没转动前的坐标）
         jit = {}
@@ -663,6 +683,8 @@ class MindMap(QOpenGLWidget):
     def relayout(self, animate=True):
         self._settle_drag()
         self._keep_links = False
+        for n in self.nodes.values():
+            n.lag = n.span = 0.0
         targets = self._targets()
         now = self.now()
         born, broken = [], []
@@ -672,8 +694,12 @@ class MindMap(QOpenGLWidget):
                 node = Node(key, kind)
                 par = self.nodes.get(parent)
                 start = QPointF(par.base) if par is not None and animate else pos
-                node.base = QPointF(start)
                 node.z = par.z if par is not None and animate else z
+                star = targets.get(f'y{self.expanded}')
+                if self._pill_wait and animate and kind != 'year' and star is not None:
+                    # 点恒星展开：胶囊等恒星停稳，从它停下的位置出发（不是从它原来的位置）
+                    start, node.z, node.lag, node.span = QPointF(star[6]), star[8], self._pill_wait, ANIM_S
+                node.base = QPointF(start)
                 node.opacity = 0.0 if animate else 1.0
                 node.fresh = animate
                 self.nodes[key] = node
@@ -694,6 +720,7 @@ class MindMap(QOpenGLWidget):
             node.polar1 = polar
             if polar is not None and node.polar0 is not None and not node.fresh:     # 转最短的方向
                 node.polar0 = (polar[0] - wrap_angle(polar[0] - node.polar0[0]), node.polar0[1])
+        self._pill_wait = 0.0
         for key, node in self.nodes.items():
             if key not in targets and not node.removing:
                 node.removing = True
@@ -720,7 +747,12 @@ class MindMap(QOpenGLWidget):
             self._anim_moving = moving          # 有东西在飞：连线先隐藏，快停稳时再出现
             years_out = any(n.removing and n.kind == 'year' for n in self.nodes.values())
             # 展开的时长要等碎片模拟完才知道（_run_pending 里改），先放一个够长的
-            self.anim.start(now, 9.0 if born else (SWALLOW_S if years_out else ANIM_S))
+            # 普通移动：每个节点等 lag 秒、走 span 秒（默认 ANIM_S，点恒星展开时恒星和其他节点慢 _slow 倍），全部到位就结束
+            self._span_base = ANIM_S * self._slow
+            dur = max(n.lag + (n.span or self._span_base) for n in self.nodes.values())
+            self.anim.start(now, 9.0 if born else (SWALLOW_S if years_out else dur), EXPAND_SOFT if self._slow > 1 else 1.0)
+            if born or years_out:
+                self._span_base = 0.0
             if broken:
                 self._pending.append(dict(kind='collapse', t0=now, nodes=broken))
             if born:
@@ -735,10 +767,12 @@ class MindMap(QOpenGLWidget):
 
     def _step(self, raw):
         """动画进行到 raw（0~1，按时间）时每个节点的位置、远近、透明度。"""
-        t = ease_spring(raw)
+        span = self._span_base or self.anim.dur         # 每个节点默认走多久（等待的胶囊晚 lag 秒开始、走自己的 span）
         for n in self.nodes.values():
+            lr = max(0.0, min(1.0, (raw * self.anim.dur - n.lag) / (n.span or span)))
+            t = ease(lr, 1.0 if n.span else self.anim.soft)       # 等待的胶囊用默认的缓动
             if n.removing and n.swallow is None:      # 碎成晶尘的胶囊：很快淡掉
-                n.opacity = n.o0 * (1 - smooth(0.0, 0.18, raw))
+                n.opacity = n.o0 * (1 - smooth(0.0, 0.18, lr))
                 continue
             if n.removing:
                 # 原地亮一下，整颗同时一粒粒碎成气体（每粒碎掉的地方气体接上，见 shards.grain_time）
@@ -764,7 +798,7 @@ class MindMap(QOpenGLWidget):
             if n.fresh and n.kind != 'year':
                 # 新出来的胶囊：从上级胶囊那里出发时完全透明，边走边慢慢显出来，差不多到位时才完全不透明
                 # （透明度和位置用同一条缓动的话，刚出发就已经三四成不透明，看着像是直接蹦出来的）
-                n.opacity = n.o1 * smooth(PILL_FADE[0], PILL_FADE[1], raw)
+                n.opacity = n.o1 * smooth(PILL_FADE[0], PILL_FADE[1], lr)
             if n.fresh and n.kind == 'year' and n.polar1 is not None:
                 # 收起倒着放：气体沿直线从黑洞喷过来，在恒星自己的位置汇成，恒星原地慢慢凝实、亮一下
                 tau = raw * self.anim.dur - n.birth_at
@@ -782,7 +816,7 @@ class MindMap(QOpenGLWidget):
         for n in self.nodes.values():
             n.polar0 = n.polar1
             n.fresh = False
-            n.form, n.flash, n.tear, n.drift_w = 1.0, 0.0, 0.0, 1.0
+            n.form, n.flash, n.tear, n.drift_w, n.lag, n.span = 1.0, 0.0, 0.0, 1.0, 0.0, 0.0
             if n.polar1 is not None:
                 a, r = n.polar1
                 n.base = QPointF(r * math.cos(a), r * math.sin(a))
@@ -856,7 +890,7 @@ class MindMap(QOpenGLWidget):
         self._cam0 = (self.cam_s, QPointF(self.cam_c), self.cine)
         self._cam1 = (s, center, self._cine_target())
         if animate:
-            self.cam.start(self.now(), CAM_S)
+            self.cam.start(self.now(), CAM_S * self._slow, EXPAND_SOFT if self._slow > 1 else 1.0)
         else:
             self.cam.stop()
             self._cam_step(1.0)
@@ -1337,7 +1371,7 @@ class MindMap(QOpenGLWidget):
                 self._finish()
         if self.cam.running:
             raw = self.cam.raw(now)
-            self._cam_step(ease_spring(raw))
+            self._cam_step(ease(raw, self.cam.soft))
             if raw >= 1.0:
                 self.cam.stop()
         else:                                   # 镜头动画被拖动、缩放打断时，视角自己慢慢过渡完
