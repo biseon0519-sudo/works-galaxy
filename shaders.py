@@ -860,20 +860,51 @@ FINAL_FS = '''
 #version 330
 uniform sampler2D u_tex, u_bloom;
 uniform float u_bloom_k;
+uniform float u_hdr, u_white, u_peak;      // HDR 输出：开没开、SDR 白色和显示器峰值（scRGB 单位，1.0 = 80 尼特）
 in vec2 v_uv; out vec4 f;
 const float K = 0.9;
 vec3 shoulder(vec3 c){
     float m = max(c.r, max(c.g, c.b));
     return m <= K ? c : c * (K + (1.0 - K) * (1.0 - exp(-(m - K) / (1.0 - K)))) / m;
 }
+vec3 lin(vec3 c){ return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c)); }
 float ign(vec2 p){ return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 void main(){
-    vec3 c = shoulder(max(texture(u_tex, v_uv).rgb, 0.0));
-    vec3 b = shoulder(texture(u_bloom, v_uv).rgb * u_bloom_k);
+    if (u_hdr < 0.5) {
+        vec3 c = shoulder(max(texture(u_tex, v_uv).rgb, 0.0));
+        vec3 b = shoulder(texture(u_bloom, v_uv).rgb * u_bloom_k);
+        vec3 room = 1.0 - min(c, 1.0);
+        c += b * room * room;                                   // 越亮的地方叠得越少，恒星表面的纹理不被冲淡
+        c += (ign(gl_FragCoord.xy) + ign(gl_FragCoord.xy + vec2(47.0, 17.0)) - 1.0) / 255.0;
+        f = vec4(c, 1.0);
+        return;
+    }
+    // HDR：亮度 1 以内和 SDR 一样（乘上 SDR 白色），更亮的部分不再压到 1，换到线性后按最大通道同比例压到显示器峰值
+    vec3 c = max(texture(u_tex, v_uv).rgb, 0.0);
+    vec3 b = texture(u_bloom, v_uv).rgb * u_bloom_k;
     vec3 room = 1.0 - min(c, 1.0);
-    c += b * room * room;                                   // 越亮的地方叠得越少，恒星表面的纹理不被冲淡
-    c += (ign(gl_FragCoord.xy) + ign(gl_FragCoord.xy + vec2(47.0, 17.0)) - 1.0) / 255.0;
-    f = vec4(c, 1.0);
+    vec3 L = lin(c + b * room * room);
+    float kl = 0.787, top = max(u_peak / u_white, 1.0);       // kl = lin(0.9)：从这里开始压
+    float m = max(L.r, max(L.g, L.b));
+    if (m > kl) L *= (kl + (top - kl) * (1.0 - exp(-(m - kl) / (top - kl)))) / m;
+    f = vec4(L * u_white, 1.0);
+}
+'''
+
+# 界面层（按钮、标题栏、对话框，Qt 画好的预乘透明度图）叠到最上面；HDR 时换成线性、按 SDR 白色的亮度
+UI_FS = '''
+#version 330
+uniform sampler2D u_ui;
+uniform float u_hdr, u_white;
+uniform ivec2 u_off;          // 导图左上角在窗口里的位置（物理像素）
+uniform int u_h;               // 导图的高度（物理像素）
+out vec4 f;
+vec3 lin(vec3 c){ return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c)); }
+void main(){
+    ivec2 p = u_off + ivec2(int(gl_FragCoord.x), u_h - 1 - int(gl_FragCoord.y));     // 图是从上往下存的
+    vec4 c = texelFetch(u_ui, p, 0).bgra;                      // Qt 的 ARGB32 在内存里是 BGRA
+    if (u_hdr > 0.5 && c.a > 0.0) c.rgb = lin(c.rgb / c.a) * c.a * u_white;
+    f = c;
 }
 '''
 

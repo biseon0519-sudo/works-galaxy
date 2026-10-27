@@ -1,18 +1,20 @@
 # 宇宙风放射状导图（显卡渲染）：中心黑洞 → 一圈年份恒星 → 展开的那一年转到右边，伸出分类 → 作品（发光胶囊）。
 # 画面全部由显卡着色器画（moderngl，着色器在 shaders.py）：内部按 2 倍分辨率渲染再缩小（超采样，1080p 屏上相当于按 4K 画），
 # 文字事先画进图集纹理，也在显卡上画。
+# 画好的图通过 D3D11 交换链送上屏幕（hdr.py）：屏幕开着 HDR 时输出真 HDR（亮的地方比 SDR 白色更亮），SDR 屏和以前一样。
 # 位置按三维存（x, y, z），用透视投影画到屏幕上：远的小一点、暗一点，拖动时移动得慢一点。鼠标扰动和漂浮只在 x、y 平面上。
 import math, random, sys
 import numpy as np
 import moderngl
-from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QTimer, QElapsedTimer
-from PySide6.QtGui import QColor, QPainter, QImage, QFontMetricsF, QCursor, QSurfaceFormat
-from PySide6.QtOpenGLWidgets import QOpenGLWidget
+from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QPoint, QTimer, QElapsedTimer
+from PySide6.QtGui import QColor, QPainter, QImage, QFontMetricsF, QCursor
+from PySide6.QtWidgets import QWidget
 from qfluentwidgets import RoundMenu, Action, FluentIcon as FIF
 from widgets import CoverPopup, font, DIGITS
-from shaders import QUAD_VS, SKY_FS, SPRITE_VS, HOLE_FS, STAR_FS, PILL_FS, BEAM_VS, BEAM_FS, DUST_FS, LABEL_FS, DOWN_FS,     BLOOM_DOWN_FS, BLOOM_UP_FS, FINAL_FS
+from shaders import QUAD_VS, SKY_FS, SPRITE_VS, HOLE_FS, STAR_FS, PILL_FS, BEAM_VS, BEAM_FS, DUST_FS, LABEL_FS, DOWN_FS,     BLOOM_DOWN_FS, BLOOM_UP_FS, FINAL_FS, UI_FS
 from shards import ShardSystem, debris, life_steps, SIM_HZ, SHARD_G
 from stream import StreamSystem, MAX_STARS
+import hdr
 
 if sys.platform == 'win32':        # Windows 默认定时器精度 15.6 毫秒，掐帧时间要 1 毫秒精度
     import ctypes
@@ -320,7 +322,8 @@ def _rgba(c, a=1.0):
     return (c.redF(), c.greenF(), c.blueF(), a)
 
 
-class MindMap(QOpenGLWidget):
+class MindMap(QWidget):
+    frameSwapped = Signal()           # 一帧送上屏幕了
     editWork = Signal(str)
     deleteWork = Signal(str)
     addWork = Signal(int, str)        # 年份, 分类（空字符串表示不指定）
@@ -330,8 +333,15 @@ class MindMap(QOpenGLWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        fmt = QSurfaceFormat(); fmt.setVersion(3, 3); fmt.setProfile(QSurfaceFormat.CompatibilityProfile)
-        self.setFormat(fmt)
+        # 画面由盖在上面的交换链子窗口显示，Qt 自己不用画这块
+        self.setAttribute(Qt.WA_OpaquePaintEvent); self.setAttribute(Qt.WA_NoSystemBackground)
+        self._present = None            # hdr.Presenter（第一次画的时候建）
+        self._ui = None                 # hdr.UiLayer：叠在上面的按钮、对话框
+        self._fallback = None           # 显卡不支持互通时：每帧读回来用 QPainter 画（慢，但能用）
+        self._screen_fbo = None         # 这一帧最后一遍画到哪
+        self._out = (False, 80.0, 80.0) # 输出：HDR 没、显示器峰值、SDR 白色（尼特）
+        self._out_t = -99.0
+        self._posted = False
         self.setMouseTracking(True)
         self.setCursor(Qt.OpenHandCursor)
         self.ctx = None
@@ -926,7 +936,7 @@ class MindMap(QOpenGLWidget):
 
     # ---------- 渲染 ----------
     def initializeGL(self):
-        self.ctx = moderngl.create_context()
+        self.ctx = moderngl.create_context(standalone=True, require=330)
         ctx = self.ctx
         quad = ctx.buffer(np.array([-1, -1, 1, -1, -1, 1, 1, 1], 'f4').tobytes())
         self.p_sky = ctx.program(vertex_shader=QUAD_VS, fragment_shader=SKY_FS)
@@ -937,6 +947,9 @@ class MindMap(QOpenGLWidget):
         self.v_down = ctx.vertex_array(self.p_down, [(quad, '2f', 'in_pos')])
         self.p_final = ctx.program(vertex_shader=QUAD_VS, fragment_shader=FINAL_FS)
         self.v_final = ctx.vertex_array(self.p_final, [(quad, '2f', 'in_pos')])
+        self.p_ui = ctx.program(vertex_shader=QUAD_VS, fragment_shader=UI_FS)
+        self.v_ui = ctx.vertex_array(self.p_ui, [(quad, '2f', 'in_pos')])
+        self.ui_tex = None
         self.p_bdown = ctx.program(vertex_shader=QUAD_VS, fragment_shader=BLOOM_DOWN_FS)
         self.v_bdown = ctx.vertex_array(self.p_bdown, [(quad, '2f', 'in_pos')])
         self.p_bup = ctx.program(vertex_shader=QUAD_VS, fragment_shader=BLOOM_UP_FS)
@@ -1096,19 +1109,14 @@ class MindMap(QOpenGLWidget):
             self.atlas[0].use(0)
             self._draw('label', labels, False, vw, vh, t, u_atlas=0)
 
-        # 缩小到屏幕（超采样）+ 辉光，统一压亮度
-        screen = ctx.detect_framebuffer(self.defaultFramebufferObject())
-        screen.use(); ctx.viewport = (0, 0, int(vw * dpr), int(vh * dpr))
+        # 缩小到屏幕（超采样）+ 辉光，统一压亮度（HDR 屏上亮的部分按尼特放开）
+        self._screen_fbo.use(); ctx.viewport = (0, 0, int(vw * dpr), int(vh * dpr))
         ctx.disable(moderngl.BLEND)
         tex.use(0); bloom.use(1)
-        self._set(self.p_final, u_tex=0, u_bloom=1, u_bloom_k=BLOOM_K / BLOOM_LEVELS)
+        on, peak, white = self._out
+        self._set(self.p_final, u_tex=0, u_bloom=1, u_bloom_k=BLOOM_K / BLOOM_LEVELS,
+                  u_hdr=float(on), u_white=white / 80, u_peak=peak / 80)
         self.v_final.render(moderngl.TRIANGLE_STRIP)
-        # 把显卡状态复原，免得影响 Qt 自己合成窗口
-        f = self.context().extraFunctions()
-        f.glBindVertexArray(0); f.glUseProgram(0); f.glBindBuffer(0x8892, 0)
-        f.glActiveTexture(0x84C0); f.glBindTexture(0x0DE1, 0)         # GL_TEXTURE0、GL_TEXTURE_2D
-        f.glBindSampler(0, 0)
-        f.glPixelStorei(0x0CF5, 4); f.glPixelStorei(0x0D05, 4)        # 解包 / 打包对齐恢复默认
 
     def _bloom(self, src, w, h):
         """辉光：先取出亮的部分缩成屏幕一半大小，再一层层缩小（每层一半），然后从最小的一层往回放大、叠到上一层，
@@ -1470,6 +1478,111 @@ class MindMap(QOpenGLWidget):
         super().showEvent(e)
         self.watchdog.start()
         self.update()
+
+    # ---------- 送上屏幕 ----------
+    def update(self):
+        """请求画下一帧（代替 QWidget.update：画面不经过 Qt 的绘制）。"""
+        if self._fallback is not None:
+            super().update()
+        elif not self._posted:
+            self._posted = True
+            QTimer.singleShot(0, self._render)
+
+    def _render(self):
+        self._posted = False
+        if not self.isVisible() or self.window().isMinimized() or self.doc is None:
+            return
+        try:
+            if self.ctx is None:
+                self.initializeGL()
+            if self._present is None and self._fallback is None:
+                try:
+                    self._present = hdr.Presenter(self.ctx, int(self.window().winId()), self.ctx.info['GL_VENDOR'])
+                    self._ui = hdr.UiLayer(self.window(), self)
+                except OSError as err:
+                    print('HDR 输出用不了，改用兼容方式：', err, flush=True)
+                    self._fallback = QImage()
+                    super().update()
+                    return
+            dpr = self.devicePixelRatioF()
+            w, h = max(1, int(self.width() * dpr)), max(1, int(self.height() * dpr))
+            t = self.now()
+            if t - self._out_t > 0.5:           # 每半秒看一次窗口在哪块屏上、HDR 开着没
+                self._out_t = t
+                self._out = self._present.display_info()
+            o = self.mapTo(self.window(), QPoint(0, 0))
+            ox, oy = round(o.x() * dpr), round(o.y() * dpr)
+            self._screen_fbo = self._present.target(ox, oy, w, h, self._out[0])
+            self.paintGL()
+            self._draw_ui(dpr, ox, oy, h)
+            self._present.present(1)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            return
+        self.frameSwapped.emit()
+
+    def _draw_ui(self, dpr, ox, oy, h):
+        """把界面层（按钮、标题栏、对话框）叠到最上面。"""
+        img, box = self._ui.capture(dpr)
+        ctx = self.ctx
+        size = (img.width(), img.height())
+        if self.ui_tex is None or self.ui_tex.size != size:
+            if self.ui_tex is not None:
+                self.ui_tex.release()
+            self.ui_tex = ctx.texture(size, 4)
+            box = (0, 0) + size
+        if box is not None and box[2] > 0 and box[3] > 0:
+            x, y, bw, bh = box
+            a = np.frombuffer(img.constBits(), np.uint8).reshape(size[1], img.bytesPerLine() // 4, 4)
+            self.ui_tex.write(np.ascontiguousarray(a[y:y + bh, x:x + bw]).tobytes(), viewport=(x, y, bw, bh))
+        ctx.enable(moderngl.BLEND)
+        ctx.blend_func = moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA
+        self.ui_tex.use(0)
+        on, _, white = self._out
+        self._set(self.p_ui, u_ui=0, u_hdr=float(on), u_white=white / 80, u_off=(ox, oy), u_h=h)
+        self.v_ui.render(moderngl.TRIANGLE_STRIP)
+
+    def _offscreen_frame(self):
+        """按 SDR 画一帧到离屏画布、读回来（截图、录屏、兼容方式用）。"""
+        if self.ctx is None:
+            self.initializeGL()
+        dpr = self.devicePixelRatioF()
+        w, h = max(1, int(self.width() * dpr)), max(1, int(self.height() * dpr))
+        old = self.off.get('grab')
+        if old is None or old[1] != (w, h):
+            if old is not None:
+                old[0].release(); old[2].release()
+            tex = self.ctx.texture((w, h), 4)
+            self.off['grab'] = (self.ctx.framebuffer(color_attachments=[tex]), (w, h), tex)
+        fbo = self.off['grab'][0]
+        keep, self._out = self._out, (False, 80.0, 80.0)
+        self._screen_fbo = fbo
+        try:
+            self.paintGL()
+        finally:
+            self._out = keep
+        img = QImage(fbo.read(components=4), w, h, w * 4, QImage.Format_RGBA8888).mirrored(False, True)
+        img.setDevicePixelRatio(dpr)
+        return img
+
+    def grabFramebuffer(self):
+        """这一帧的画面（SDR，不含按钮），测试截图和录屏用。"""
+        return self._offscreen_frame()
+
+    def paintEvent(self, e):
+        if self._fallback is None or self.doc is None:
+            return
+        try:
+            self._fallback = self._offscreen_frame()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            return
+        p = QPainter(self)
+        p.drawImage(0, 0, self._fallback)
+        p.end()
+        self.frameSwapped.emit()
 
     def hideEvent(self, e):
         super().hideEvent(e)
