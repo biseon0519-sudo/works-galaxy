@@ -168,39 +168,20 @@ float fbm4(vec2 p){ float v = 0., a = .5; for (int i = 0; i < 4; i++){ v += a * 
 const float R_IN = 2.3, R_OUT = 6.2;
 // 盘的外缘：全图 R_OUT_MAP、近景 R_OUT_CINE（见 Python 里的 DISK_OUT_*）。
 // 亮度、颜色、厚度按“缩回 R_OUT 大小后的半径” rn 算，大盘就是把原来的样子等比例拉宽；转速、多普勒、细丝按真实半径
-#ifndef R_OUT_MAP
-#define R_OUT_MAP DISK_OUT_MAP_
-#endif
-#ifndef R_OUT_CINE
-#define R_OUT_CINE DISK_OUT_CINE_
-#endif
-#ifndef TH_POW
-#define TH_POW 0.0
-#endif
+#define R_OUT_MAP ''' + repr(DISK_OUT_MAP) + '''
+#define R_OUT_CINE ''' + repr(DISK_OUT_CINE) + '''
 float ROUT = R_OUT, SC = 1.0;                               // 这一帧的盘外缘、拉宽了几倍（main 里按近景程度设）
 float rnorm(float rr){ return R_IN + (rr - R_IN) / SC; }
 // 星际穿越的样子：亮度往外掉得快（内圈白热、外圈暗成琥珀褐），沿轨道拉长的细丝（STREAK_F 每单位半径几道，
-// STREAK_MIX 改密度、STREAK_EMIT 改亮度），多普勒两边的差别减半（电影里几乎没有一边亮一边暗）。调参时可以在前面先 #define 覆盖
-#ifndef DISK_FALL
+// STREAK_MIX 改密度、STREAK_EMIT 改亮度），多普勒两边的差别减半（电影里几乎没有一边亮一边暗）
 #define DISK_FALL 2.6
-#endif
-#ifndef DISK_GAIN
 #define DISK_GAIN 2.4
-#endif
-#ifndef STREAK_F
 #define STREAK_F 5.0
-#endif
-#ifndef STREAK_MIX
 #define STREAK_MIX 0.7
-#endif
-#ifndef STREAK_EMIT
 #define STREAK_EMIT 0.7
-#endif
-#ifndef DOP_K
 #define DOP_K 0.5
-#endif
 // 盘有厚度（不是一张纸）：半厚度内薄外厚，外缘微微鼓起
-float halfH(float rr){ return (0.04 + 0.045 * (clamp(rnorm(rr), R_IN, R_OUT) - R_IN)) * pow(SC, TH_POW); }    // 拉宽时厚度不跟着等比例加厚，看起来更薄更开阔
+float halfH(float rr){ return 0.04 + 0.045 * (clamp(rnorm(rr), R_IN, R_OUT) - R_IN); }    // 拉宽时厚度不跟着加厚，看起来更薄更开阔
 // 盘里一点的发光颜色（rgb）和密度（a）
 vec4 disk(vec3 hit, float rr, vec3 v){
     float phi = atan(hit.z, hit.x);
@@ -322,8 +303,7 @@ void main(){
           + HL_GULP * vec3(1.0, 0.7, 0.45) * hv * hv * exp(-max(rq - 1.6, 0.0) * 1.2) * (1.0 - alpha)) * op * win;
 }
 '''
-HOLE_FS = with_hl(HOLE_FS.replace('#version 330', '#version 330\n' + HL_DEFS, 1)
-                  .replace('DISK_OUT_MAP_', repr(DISK_OUT_MAP)).replace('DISK_OUT_CINE_', repr(DISK_OUT_CINE)))
+HOLE_FS = with_hl(HOLE_FS.replace('#version 330', '#version 330\n' + HL_DEFS, 1))
 
 # 恒星：照着太阳实拍的样子——会自转的球面上有米粒状的对流元胞、明暗斑、几个黑子（本影 + 半影），边缘变暗偏红，
 # 边上一圈色球层和一缕缕往外喷的日珥，外面是带放射状亮纹的日冕。朝黑洞那一侧被潮汐轻轻拉出一点，物质从那里被吸走
@@ -332,12 +312,8 @@ STAR_FS = '''
 #define STAR_EXPO 0.85
 #define PALE_K 0.8
 #define PALE_SAT 1.0
-#ifndef STAR_SPIN
 #define STAR_SPIN 0.1
-#endif
-#ifndef RIM_K
 #define RIM_K 0.9
-#endif
 #define GRAIN ''' + repr(GRAIN) + '''
 #define GRAIN_SPAN ''' + repr(GRAIN_SPAN) + '''
 #define GRAIN_GO ''' + repr(GRAIN_GO) + '''

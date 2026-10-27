@@ -27,7 +27,6 @@ STAR_COLORS = ['#ff9a5c', '#ffc46b', '#ffe6a8', '#fff4e0', '#e4ecff', '#b9cfff',
 DISK_COLOR = QColor('#ffb36b')        # 黑洞吸积盘的颜色，中心到年份的光线从这个颜色开始
 
 SS = 2                    # 超采样倍数（内部按几倍分辨率画）
-HOLE_RES = 1.0            # 黑洞光追按屏幕分辨率的几倍画（最费显卡的一遍；0.75 倍省约 30%，但放大看会糊，用户要清楚）
 MAX_TEX = 4096            # 内部画布最大边长
 # 内部 HDR：中间画布都是 16 位浮点，叠加的光不会被截断，很淡的粒子也不会被舍掉；最后一遍统一加辉光、压亮度、抖动（FINAL_FS）。
 # 辉光从画面里比 BLOOM_T 亮的部分取（文字不算），BLOOM_LEVELS 层由近到远的柔光，BLOOM_K 是强度
@@ -1245,8 +1244,7 @@ class MindMap(QWidget):
         """黑洞逐像素追光线很费显卡，而且画面本身很柔和：按屏幕原分辨率单独画（像素少 4 倍），再放大叠进超采样画布。"""
         ctx = self.ctx
         vw, vh = self.width(), self.height()
-        hs = HOLE_RES                           # 黑洞画面很柔和，再低一点分辨率画也看不出来
-        hw_, hh_ = max(1, int(vw * dpr * hs)), max(1, int(vh * dpr * hs))
+        hw_, hh_ = max(1, int(vw * dpr)), max(1, int(vh * dpr))
         on = self._out[0]
         hname = 'hole_hl' if on else 'hole'
         hfbo, _, htex = self._offscreen(hname, hw_, hh_, hl=on)
