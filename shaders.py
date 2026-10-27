@@ -2,6 +2,12 @@
 # 物质流、恒星解体的气体是很多颗很淡的粒子叠出来的。中间画布改成浮点（见 mindmap 的 HDR 部分）以前，每颗粒子边缘
 # 不到 1/255 的光会被舍掉；浮点画布全保留，整体会亮一些。乘这个系数，让整体亮度和以前调好的差不多（边缘更柔和）
 GAS_K = 0.8
+# HDR 高光强度（只在 HDR 屏上有，加在 SDR 画面之上；线性，1 = 再亮一个 SDR 白色）。总上限见 mindmap.HDR_PEAK
+HL = dict(HL_DISK=1.4, HL_DISK_POW=2.5, HL_RING=2.5, HL_GULP=1.5, HL_CORE=0.35, HL_FLASH=1.2, HL_SPARK=2.0, HL_GAS=0.8,
+          HL_STAR=2.5)
+import os as _os      # 调参用：环境变量 HL_DISK=… 临时覆盖（不改代码）
+HL.update({k: float(_os.environ[k]) for k in HL if k in _os.environ})
+HL_DEFS = ''.join(f'#define {k} {v!r}\n' for k, v in HL.items())
 # 恒星解体时碎成的晶胞：气体分布半径里每单位多少格；每粒开始碎的时刻在 tear 的 0~GRAIN_SPAN 里均匀随机（剩下的是碎掉要多久）。
 # shards.grain_time 用同样的散列给每团气体定出发时刻，两边要一致
 GRAIN = 8.0
@@ -13,6 +19,24 @@ float noise(vec2 p){ vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3. - 2. 
     return mix(mix(hash(i), hash(i + vec2(1, 0)), u.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), u.x), u.y); }
 float fbm(vec2 p){ float v = 0., a = .5; for (int i = 0; i < 5; i++){ v += a * noise(p); p = p * 2.03 + vec2(1.7, 9.2); a *= .5; } return v; }
 '''
+
+# HDR 高光层：画进主画布的着色器都多输出一张图（第二个颜色附件），记“比 SDR 白色亮出来多少”（线性，SDR 白色 = 1）。
+# 各着色器的 main 改名成 main_，往全局变量 hl 里写；包装的 main 统一输出 f_hl = (hl, f.a)——
+# 预乘透明度的东西（胶囊、文字）会照常挡住后面的高光。SDR 屏上主画布没有第二个附件，写了也被丢掉，画面不变。
+HL_OUT = '''
+layout(location = 0) out vec4 f;
+layout(location = 1) out vec4 f_hl;
+vec3 hl = vec3(0.0);
+'''
+HL_MAIN = '''
+void main(){ main_(); f_hl = vec4(hl, f.a); }
+'''
+
+
+def with_hl(src):
+    assert src.count('out vec4 f;') == 1 and src.count('void main(){') == 1
+    return src.replace('out vec4 f;', HL_OUT, 1).replace('void main(){', 'void main_(){', 1) + HL_MAIN
+
 
 QUAD_VS = '''
 #version 330
@@ -96,14 +120,18 @@ void main(){
     col += stars(sp + u_pan * 0.02, 9.0, 0.10, 0.55);
     col += stars(sp + u_pan * 0.05, 23.0, 0.16, 0.8) * 1.2;
     col += stars(sp + u_pan * 0.10, 61.0, 0.22, 1.15) * 1.5;
+    vec3 st = col - low.rgb;
+    hl = st * HL_STAR * smoothstep(0.25, 0.9, max(st.r, max(st.g, st.b)));
     // 展开的近景：黑洞周围的星空被压暗，画面边缘也暗一圈，黑洞显得更沉、更有压迫感
     float dark = exp(-max(r - u_bh.z, 0.0) / (u_bh.z * 1.4)) * 0.6
                + smoothstep(0.45, 1.0, length((v_uv - 0.5) * vec2(1.25, 1.0)) * 1.35) * 0.4;
     col *= 1.0 - u_cine * dark;
+    hl *= 1.0 - u_cine * dark;
     f = vec4(col, 1.0);
 #endif
 }
 '''
+SKY_FS = with_hl(SKY_FS.replace('#version 330', '#version 330\n' + HL_DEFS, 1))
 
 SPRITE_VS = '''
 #version 330
@@ -179,6 +207,7 @@ void main(){
     vec3 v = normalize(fw + (q.x * rt + q.y * up) / D);
     vec3 p = cam;
     vec3 col = vec3(0.0); float trans = 1.0;
+    vec3 hot = vec3(0.0); float ringH = 0.0;               // HDR 高光：盘最内圈的光、光子环
     const float RB = 16.0;                                  // 这个范围外光线几乎不弯，也碰不到盘
     float b = dot(p, v), disc = b * b - (dot(p, p) - RB * RB);
     if (disc > 0.0){                                        // 光线会经过黑洞附近：先直线走过去，再一步步算弯曲
@@ -213,6 +242,7 @@ void main(){
                     e.rgb *= 1.0 - 0.7 * under;
                     float dA = 1.0 - exp(-e.a * dt * mix(9.0, 2.5, under));       // 吸收强一点：看到的是盘最外面一层，湍流细节不会被平均掉
                     col += trans * e.rgb * dA;
+                    hot += trans * e.rgb * dA * pow(R_IN / sr, HL_DISK_POW);
                     trans *= 1.0 - dA;
                 }
             }
@@ -225,6 +255,7 @@ void main(){
         else {                // 光子环：贴着光子球（1.5 倍视界）绕过的光，阴影边上一圈锐利的细亮线
             float ring = exp(-pow((rmin - 1.56) / 0.06, 2.0));
             col += vec3(1.0, 0.86, 0.7) * ring * 0.9 * trans;
+            ringH = ring * trans;
             trans *= 1.0 - ring * 0.6;
         }
     }
@@ -234,8 +265,11 @@ void main(){
     col = 1.0 - exp(-col * mix(1.25, 0.95, v_p2.z));        // 色调映射，亮处不发白爆掉；近景收一点曝光，盘不糊成一片
     float win = 1.0 - smoothstep(0.8, 1.0, max(abs(v_local.x), abs(v_local.y)) / half_);
     f = vec4(col * op * win, alpha * op * win);
+    hl = (HL_DISK * hot * mix(1.0, 0.8, v_p2.z) + HL_RING * vec3(1.0, 0.86, 0.7) * ringH
+          + HL_GULP * vec3(1.0, 0.7, 0.45) * hv * hv * exp(-max(rq - 1.6, 0.0) * 1.2) * (1.0 - alpha)) * op * win;
 }
 '''
+HOLE_FS = with_hl(HOLE_FS.replace('#version 330', '#version 330\n' + HL_DEFS, 1))
 
 # 恒星：照着太阳实拍的样子——会自转的球面上有米粒状的对流元胞、明暗斑、几个黑子（本影 + 半影），边缘变暗偏红，
 # 边上一圈色球层和一缕缕往外喷的日珥，外面是带放射状亮纹的日冕。朝黑洞那一侧被潮汐轻轻拉出一点，物质从那里被吸走
@@ -355,8 +389,12 @@ void main(){
     float shade = act * 0.45 * exp(-o * 1.3) * (1.0 - smoothstep(2.6, 4.6, max(abs(q0.x), abs(q0.y)))) * (1.0 - tear);
     // 散到一半的地方主要是发光、不怎么挡后面（不然半透明的残块会显成暗灰的斑）
     f = vec4(col * op, (body * keep + (1.0 - body0) * shade) * op);
+    float flashH = clamp(hv - 1.0, 0.0, 1.5);
+    vec3 whiteHot = mix(c, vec3(1.0, 0.97, 0.92), 0.7);
+    hl = (HL_CORE * exp(-r * r * 3.0) * glowk + HL_FLASH * flashH * (glowk + exp(-o * 3.0) * (1.0 - body0) * 0.5)) * whiteHot * op;
 }
 '''
+STAR_FS = with_hl(STAR_FS.replace('#version 330', '#version 330\n' + HL_DEFS, 1))
 
 # 胶囊（分类、作品、添加按钮）：半透明的黑水晶——深色晶体能隐约透出后面的星空，几个切面明暗不同、切面之间有细亮的棱，
 # 边缘内侧一圈折射般的亮边，顶上一道锐利的高光，偶尔有一道反光扫过；朝向父节点那侧的描边被照亮
@@ -406,6 +444,7 @@ void main(){
     f = vec4(col * op, alpha * op);
 }
 '''
+PILL_FS = with_hl(PILL_FS.replace('#version 330', '#version 330\n' + HL_DEFS, 1))
 
 # 连线（加色混合）：kind 0 = 恒星被黑洞抽出的物质流，越靠近黑洞越宽越亮，一缕缕气体和光点往里流；
 # kind 1 = 分支里柔软的光丝，细亮线 + 柔光，光点沿着往外流
@@ -470,6 +509,7 @@ void main(){
     f = vec4(col * v_color.a, 0.0);
 }
 '''
+BEAM_FS = with_hl(BEAM_FS.replace('#version 330', '#version 330\n' + HL_DEFS, 1))
 
 # ---------- 物质流（stream.py）----------
 # 坐标：以黑洞为中心、视界半径为单位，x 向右、y 向上（屏幕平面里，去掉了滚转），z 朝画面里面（和黑洞光追的相机一致）。
@@ -617,8 +657,10 @@ void main(){
         I = exp(-d2 * 3.0) * 0.9 * tw;
     }
     f = vec4(v_col.rgb * I * v_col.a * win, 0.0);
+    hl = v_col.rgb * I * v_col.a * win * (v_kind.x < 0.5 ? HL_GAS : HL_SPARK);
 }
 '''
+STREAM_FS = with_hl(STREAM_FS.replace('#version 330', '#version 330\n' + HL_DEFS, 1))
 
 # ---------- 恒星被黑洞撕碎（shards.py）----------
 # 模拟：transform feedback，每个顶点是一片碎片，一遍往前算 8 步（1/120 秒一步），把 8 个位置都输出来记下路线。
@@ -781,8 +823,10 @@ void main(){
         col = mix(cs, vec3(1.0, 0.6, 0.35), 0.35) * exp(-dot(q, q) * 1.4) * cloud * 0.04 * u_gas;
     }
     f = vec4(col * op * win, 0.0);
+    hl = col * op * win * (kind < 0.5 ? HL_SPARK : HL_GAS);
 }
 '''
+SHARD_FS = with_hl(SHARD_FS.replace('#version 330', '#version 330\n' + HL_DEFS, 1))
 
 # 晶尘：胶囊碎掉时迸出的菱形小碎屑，会闪，带一点十字闪光；加色混合
 DUST_FS = '''
@@ -802,6 +846,7 @@ void main(){
     f = vec4(col * a * win, 0.0);
 }
 '''
+DUST_FS = with_hl(DUST_FS.replace('#version 330', '#version 330\n' + HL_DEFS, 1))
 
 # 文字：所有标签事先画进一张图集（超采样分辨率 + 多级纹理），每帧按位置、缩放、透明度一次画完
 LABEL_FS = '''
@@ -814,6 +859,7 @@ void main(){
     f = texture(u_atlas, uv) * v_p1.x;
 }
 '''
+LABEL_FS = with_hl(LABEL_FS.replace('#version 330', '#version 330\n' + HL_DEFS, 1))
 
 # ---------- 内部 HDR：中间画布都是 16 位浮点，最后一遍统一处理 ----------
 # 辉光：从画面里取出亮的部分，一层层缩小（每层一半），再一层层放大叠回来，得到由近到远都有的柔光
@@ -858,9 +904,10 @@ void main(){
 # 平滑地压进去，三个通道按同一个比例压（分开压会把黄色的恒星压得发白）；辉光主要照亮暗的周围，叠在本来就亮的地方很少（不会把恒星表面、吸积盘冲成一片白）；最后加一点抖动，深色渐变不出色带
 FINAL_FS = '''
 #version 330
-uniform sampler2D u_tex, u_bloom;
+uniform sampler2D u_tex, u_bloom, u_hltex;
 uniform float u_bloom_k;
 uniform float u_hdr, u_white, u_peak;      // HDR 输出：开没开、SDR 白色和显示器峰值（scRGB 单位，1.0 = 80 尼特）
+uniform float u_flip;                      // 画进 D3D 纹理时上下翻转（D3D 从上往下存，OpenGL 从下往上）
 in vec2 v_uv; out vec4 f;
 const float K = 0.9;
 vec3 shoulder(vec3 c){
@@ -870,23 +917,26 @@ vec3 shoulder(vec3 c){
 vec3 lin(vec3 c){ return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c)); }
 float ign(vec2 p){ return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 void main(){
+    vec2 uv = vec2(v_uv.x, u_flip > 0.5 ? 1.0 - v_uv.y : v_uv.y);
     if (u_hdr < 0.5) {
-        vec3 c = shoulder(max(texture(u_tex, v_uv).rgb, 0.0));
-        vec3 b = shoulder(texture(u_bloom, v_uv).rgb * u_bloom_k);
+        vec3 c = shoulder(max(texture(u_tex, uv).rgb, 0.0));
+        vec3 b = shoulder(texture(u_bloom, uv).rgb * u_bloom_k);
         vec3 room = 1.0 - min(c, 1.0);
         c += b * room * room;                                   // 越亮的地方叠得越少，恒星表面的纹理不被冲淡
         c += (ign(gl_FragCoord.xy) + ign(gl_FragCoord.xy + vec2(47.0, 17.0)) - 1.0) / 255.0;
         f = vec4(c, 1.0);
         return;
     }
-    // HDR：亮度 1 以内和 SDR 一样（乘上 SDR 白色），更亮的部分不再压到 1，换到线性后按最大通道同比例压到显示器峰值
-    vec3 c = max(texture(u_tex, v_uv).rgb, 0.0);
-    vec3 b = texture(u_bloom, v_uv).rgb * u_bloom_k;
+    // HDR：先算出和 SDR 屏上一模一样的画面（不抖动，浮点不需要），换到线性、乘 SDR 白色；
+    // 再加上高光层（黑洞、恒星、物质流、星空比白色亮出来的部分），超过白色的按最大通道同比例软压到上限
+    vec3 c = shoulder(max(texture(u_tex, uv).rgb, 0.0));
+    vec3 b = shoulder(texture(u_bloom, uv).rgb * u_bloom_k);
     vec3 room = 1.0 - min(c, 1.0);
-    vec3 L = lin(c + b * room * room);
-    float kl = 0.787, top = max(u_peak / u_white, 1.0);       // kl = lin(0.9)：从这里开始压
+    c += b * room * room;
+    vec3 L = lin(c) + max(texture(u_hltex, uv).rgb, 0.0);
+    float top = max(u_peak / u_white, 1.0);
     float m = max(L.r, max(L.g, L.b));
-    if (m > kl) L *= (kl + (top - kl) * (1.0 - exp(-(m - kl) / (top - kl)))) / m;
+    if (m > 1.0 && top > 1.0) L *= (1.0 + (top - 1.0) * (1.0 - exp(-(m - 1.0) / (top - 1.0)))) / m;
     f = vec4(L * u_white, 1.0);
 }
 '''
@@ -898,10 +948,12 @@ uniform sampler2D u_ui;
 uniform float u_hdr, u_white;
 uniform ivec2 u_off;          // 导图左上角在窗口里的位置（物理像素）
 uniform int u_h;               // 导图的高度（物理像素）
+uniform float u_flip;          // 画进 D3D 纹理时上下翻转
 out vec4 f;
 vec3 lin(vec3 c){ return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c)); }
 void main(){
-    ivec2 p = u_off + ivec2(int(gl_FragCoord.x), u_h - 1 - int(gl_FragCoord.y));     // 图是从上往下存的
+    int y = int(gl_FragCoord.y);
+    ivec2 p = u_off + ivec2(int(gl_FragCoord.x), u_flip > 0.5 ? y : u_h - 1 - y);     // 图是从上往下存的
     vec4 c = texelFetch(u_ui, p, 0).bgra;                      // Qt 的 ARGB32 在内存里是 BGRA
     if (u_hdr > 0.5 && c.a > 0.0) c.rgb = lin(c.rgb / c.a) * c.a * u_white;
     f = c;
@@ -911,7 +963,8 @@ void main(){
 # 把按屏幕原分辨率单独画的黑洞放大叠进超采样画布（保留透明度）
 DOWN_FS = '''
 #version 330
-uniform sampler2D u_tex;
+uniform sampler2D u_tex, u_tex_hl;
 in vec2 v_uv; out vec4 f;
-void main(){ f = texture(u_tex, v_uv); }
+void main(){ f = texture(u_tex, v_uv); hl = texture(u_tex_hl, v_uv).rgb; }
 '''
+DOWN_FS = with_hl(DOWN_FS.replace('#version 330', '#version 330\n' + HL_DEFS, 1))

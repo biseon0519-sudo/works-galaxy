@@ -79,6 +79,7 @@ LEAF, GROUP_GAP = 36, 18  # 展开的分支里：每个作品占的高度、分�
 BEND = 0.00022            # 分支的弧度：离中线越远越往回收一点，看起来是一段圆弧
 # 帧率：有动画、鼠标在动时跟着屏幕刷新（120Hz 屏就是 120 帧）；只是慢慢漂浮时隔一帧画一帧（约 60 帧）。
 # Qt 的显卡控件每画一帧都要占满一个核心等屏幕刷新，空闲时减半能省一半 CPU、少发热
+HDR_PEAK = 750           # HDR 屏上最亮到多少尼特（显示器峰值更低时按显示器的）
 MAX_FPS = 120             # 帧率上限：刷新率更高的屏幕（144、240Hz）也不超过 120 帧
 FRAME_MARGIN = 0.0006     # 满帧率时提前多少秒开始画下一帧（掐着屏幕刷新的点画，CPU 就不用干等）
 IDLE_WAIT_MS = 11         # 空闲时画完一帧后等多久再画下一帧（比一个刷新周期长一点，正好落到下下次刷新）
@@ -339,6 +340,7 @@ class MindMap(QWidget):
         self._ui = None                 # hdr.UiLayer：叠在上面的按钮、对话框
         self._fallback = None           # 显卡不支持互通时：每帧读回来用 QPainter 画（慢，但能用）
         self._screen_fbo = None         # 这一帧最后一遍画到哪
+        self._flip = False              # 最后一遍要不要上下翻转（画进交换链的 D3D 纹理时要）
         self._out = (False, 80.0, 80.0) # 输出：HDR 没、显示器峰值、SDR 白色（尼特）
         self._out_t = -99.0
         self._posted = False
@@ -968,22 +970,31 @@ class MindMap(QWidget):
         self.v_beam = ctx.vertex_array(self.p_beam, [(self.beam_buf, '2f 1f 1f 1f 1f 1f 4f', 'in_pos', 'in_x', 'in_w', 'in_along',
                                                       'in_s', 'in_kind', 'in_color')])
         self.off = {}
+        self.off_hl = {}
         self.atlas = None               # (纹理, 画的分辨率, {节点 key: (签名, uv, 左, 上, 宽, 高)})
         self.parts = ShardSystem(ctx, RS, FOCAL)
         self.stream = StreamSystem(ctx)
 
-    def _offscreen(self, name, w, h, clamp=False):
+    def _offscreen(self, name, w, h, clamp=False, hl=False):
         """离屏画布（按名字各一块，尺寸变了重建，16 位浮点）：main 是超采样的整张图，hole 是按屏幕原分辨率单独画的黑洞，
-        bloom0… 是辉光一层层缩小的图。clamp：取样超出边缘时用边上的颜色（辉光用，不然左边的光会从右边冒出来）。"""
+        bloom0… 是辉光一层层缩小的图。clamp：取样超出边缘时用边上的颜色（辉光用，不然左边的光会从右边冒出来）。
+        hl：多一张 HDR 高光层（第二个颜色附件，见 shaders.HL_OUT），在 self.off_hl[name]。"""
         old = self.off.get(name)
         if old is None or old[1] != (w, h):
             if old is not None:
                 old[0].release(); old[2].release()
-            tex = self.ctx.texture((w, h), 4, dtype='f2')
-            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-            if clamp:
-                tex.repeat_x = tex.repeat_y = False
-            self.off[name] = (self.ctx.framebuffer(color_attachments=[tex]), (w, h), tex)
+                if name in self.off_hl:
+                    self.off_hl.pop(name).release()
+            texs = []
+            for _ in range(2 if hl else 1):
+                tex = self.ctx.texture((w, h), 4, dtype='f2')
+                tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                if clamp:
+                    tex.repeat_x = tex.repeat_y = False
+                texs.append(tex)
+            if hl:
+                self.off_hl[name] = texs[1]
+            self.off[name] = (self.ctx.framebuffer(color_attachments=texs), (w, h), texs[0])
         return self.off[name]
 
     @staticmethod
@@ -1075,7 +1086,9 @@ class MindMap(QWidget):
         vw, vh = self.width(), self.height()
         ss = min(SS, MAX_TEX / max(1, vw * dpr), MAX_TEX / max(1, vh * dpr))
         W, H = max(1, int(vw * dpr * ss)), max(1, int(vh * dpr * ss))
-        fbo, _, tex = self._offscreen('main', W, H)
+        hdr_on = self._out[0]                   # HDR 屏：主画布多一张高光层（名字分开，切换时不用重建）
+        main = 'main_hl' if hdr_on else 'main'
+        fbo, _, tex = self._offscreen(main, W, H, hl=hdr_on)
         t = self.now()
         if self._pending:
             self._run_pending()
@@ -1113,9 +1126,10 @@ class MindMap(QWidget):
         self._screen_fbo.use(); ctx.viewport = (0, 0, int(vw * dpr), int(vh * dpr))
         ctx.disable(moderngl.BLEND)
         tex.use(0); bloom.use(1)
+        self.off_hl.get(main, tex).use(2)
         on, peak, white = self._out
-        self._set(self.p_final, u_tex=0, u_bloom=1, u_bloom_k=BLOOM_K / BLOOM_LEVELS,
-                  u_hdr=float(on), u_white=white / 80, u_peak=peak / 80)
+        self._set(self.p_final, u_tex=0, u_bloom=1, u_hltex=2, u_bloom_k=BLOOM_K / BLOOM_LEVELS,
+                  u_hdr=float(on), u_white=white / 80, u_peak=min(peak, HDR_PEAK) / 80, u_flip=float(self._flip))
         self.v_final.render(moderngl.TRIANGLE_STRIP)
 
     def _bloom(self, src, w, h):
@@ -1227,13 +1241,15 @@ class MindMap(QWidget):
         ctx = self.ctx
         vw, vh = self.width(), self.height()
         hw_, hh_ = max(1, int(vw * dpr)), max(1, int(vh * dpr))
-        hfbo, _, htex = self._offscreen('hole', hw_, hh_)
+        on = self._out[0]
+        hname = 'hole_hl' if on else 'hole'
+        hfbo, _, htex = self._offscreen(hname, hw_, hh_, hl=on)
         hfbo.use(); ctx.viewport = (0, 0, hw_, hh_); hfbo.clear(0.0, 0.0, 0.0, 0.0)
         self._draw('hole', np.array(holes, 'f4'), False, vw, vh, t)
         fbo.use(); ctx.viewport = (0, 0, W, H)
-        htex.use(0)
+        htex.use(0); self.off_hl.get(hname, htex).use(1)
         ctx.blend_func = moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA
-        self._set(self.p_down, u_tex=0)
+        self._set(self.p_down, u_tex=0, u_tex_hl=1)
         self.v_down.render(moderngl.TRIANGLE_STRIP)
 
     def _draw_particles(self, vw, vh, t):
@@ -1513,6 +1529,7 @@ class MindMap(QWidget):
             o = self.mapTo(self.window(), QPoint(0, 0))
             ox, oy = round(o.x() * dpr), round(o.y() * dpr)
             self._screen_fbo = self._present.target(ox, oy, w, h, self._out[0])
+            self._flip = True
             self.paintGL()
             self._draw_ui(dpr, ox, oy, h)
             self._present.present(1)
@@ -1540,7 +1557,7 @@ class MindMap(QWidget):
         ctx.blend_func = moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA
         self.ui_tex.use(0)
         on, _, white = self._out
-        self._set(self.p_ui, u_ui=0, u_hdr=float(on), u_white=white / 80, u_off=(ox, oy), u_h=h)
+        self._set(self.p_ui, u_ui=0, u_hdr=float(on), u_white=white / 80, u_off=(ox, oy), u_h=h, u_flip=1.0)
         self.v_ui.render(moderngl.TRIANGLE_STRIP)
 
     def _offscreen_frame(self):
@@ -1557,7 +1574,7 @@ class MindMap(QWidget):
             self.off['grab'] = (self.ctx.framebuffer(color_attachments=[tex]), (w, h), tex)
         fbo = self.off['grab'][0]
         keep, self._out = self._out, (False, 80.0, 80.0)
-        self._screen_fbo = fbo
+        self._screen_fbo, self._flip = fbo, False
         try:
             self.paintGL()
         finally:
