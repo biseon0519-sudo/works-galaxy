@@ -22,7 +22,7 @@
 
 ## 下载使用（不用装 Python）
 
-1. 到 [Releases](../../releases) 下载最新的 `yearly-works-v<版本>.zip`，解压到任意文件夹
+1. 到 [Releases](../../releases) 下载最新的 `works-galaxy-v<版本>.zip`，解压到任意文件夹
 2. 双击 `年度作品.exe`
 3. 右上角「添加年份」先建一年，点那颗恒星展开，点「＋」或右键恒星添加作品；点作品编辑，右键删除
 
@@ -49,7 +49,7 @@ python -m venv .venv
 .venv\Scripts\python build.py
 ```
 
-生成 `dist\年度作品\`（双击里面的 `年度作品.exe`）和压缩包 `dist\yearly-works-v<版本>.zip`。只打包代码和图标，`data\`、`settings.json` 等个人数据不会进去。
+生成 `dist\年度作品\`（双击里面的 `年度作品.exe`）和压缩包 `dist\works-galaxy-v<版本>.zip`。只打包代码和图标，`data\`、`settings.json` 等个人数据不会进去。
 
 ## 代码结构
 

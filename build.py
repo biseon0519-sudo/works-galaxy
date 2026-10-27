@@ -1,5 +1,5 @@
 # 打包给别人用：.venv\Scripts\python.exe build.py
-# 生成 dist\年度作品\（双击里面的 年度作品.exe 就能用，不用装 Python），再压成 dist\yearly-works-v<版本>.zip。
+# 生成 dist\年度作品\（双击里面的 年度作品.exe 就能用，不用装 Python），再压成 dist\works-galaxy-v<版本>.zip。
 # 只打包代码和图标；data\、settings.json、log.txt 这些个人数据不会进去，朋友打开是一张空白的星图。
 import os, re, shutil, subprocess, sys, zipfile
 
@@ -44,7 +44,7 @@ def main():
     os.rmdir(inner)
     with open(os.path.join(OUT, '使用说明.txt'), 'w', encoding='utf-8-sig') as f:
         f.write(README)
-    zip_path = os.path.join(DIST, f'yearly-works-v{VERSION}.zip')    # GitHub Releases 的附件名不能有中文
+    zip_path = os.path.join(DIST, f'works-galaxy-v{VERSION}.zip')    # GitHub Releases 的附件名不能有中文
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
         for root, _, files in os.walk(OUT):
             for f in files:
