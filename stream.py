@@ -5,7 +5,7 @@
 import math
 import numpy as np
 import moderngl
-from shaders import STREAM_SIM_VS, STREAM_VS, STREAM_FS, GAS_K
+from shaders import STREAM_SIM_VS, STREAM_VS, STREAM_FS, GAS_K, DISK_OUT_MAP, DISK_OUT_CINE
 
 MAX_STARS = 32            # 和着色器里的 MAXS 一致
 PER_STAR = 800            # 每颗恒星的粒子数（稀一点，像原来那样薄薄的一股）
@@ -44,6 +44,7 @@ class StreamSystem:
         self.cur = 0
         self.stars = np.zeros((MAX_STARS, 4), 'f4')
         self.prev = None
+        self.view = ((0.0, 1.0, 0.0), DISK_OUT_MAP)   # 吸积盘的法线、外缘（update 里设，draw 里挡住盘后面的粒子用）
         self.need_reset = True
         self.grow = False
         self.warm_left = 0        # 还要快进几遍；快进完之前不画
@@ -75,6 +76,7 @@ class StreamSystem:
             sp = np.hypot(vel[:, 0], vel[:, 1])[:, None]
             vel *= np.minimum(1.0, lim / np.maximum(sp, 1e-6))
         self.prev = stars.copy()
+        self.view = ((0.0, math.cos(el), -math.sin(el)), DISK_OUT_MAP + (DISK_OUT_CINE - DISK_OUT_MAP) * cine)
         sim = self.sim
         sim['u_star'].write(stars.tobytes())
         sim['u_svel'].write(vel.tobytes())
@@ -100,7 +102,8 @@ class StreamSystem:
         prog = self.prog
         prog['u_star'].write(self.stars_for_draw.tobytes())
         prog['u_scol'].write(np.asarray(colors, 'f4').tobytes())
-        for k, v in dict(u_vp=(vw, vh), u_bh=(bh[0], bh[1], rs_px), u_roll=roll, u_alpha=alpha, u_disk=disk, u_time=t, u_gas=GAS_K).items():
+        for k, v in dict(u_vp=(vw, vh), u_bh=(bh[0], bh[1], rs_px), u_roll=roll, u_alpha=alpha, u_disk=disk, u_time=t, u_gas=GAS_K,
+                         u_n=self.view[0], u_rout=self.view[1]).items():
             m = prog.get(k, None)
             if m is not None:
                 m.value = v

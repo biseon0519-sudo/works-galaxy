@@ -11,7 +11,7 @@ from PySide6.QtGui import QColor, QPainter, QImage, QFontMetricsF, QCursor
 from PySide6.QtWidgets import QWidget
 from qfluentwidgets import RoundMenu, Action, FluentIcon as FIF
 from widgets import CoverPopup, font, DIGITS
-from shaders import QUAD_VS, SKY_FS, SPRITE_VS, HOLE_FS, STAR_FS, PILL_FS, BEAM_VS, BEAM_FS, DUST_FS, LABEL_FS, DOWN_FS,     BLOOM_DOWN_FS, BLOOM_UP_FS, FINAL_FS, UI_FS
+from shaders import QUAD_VS, SKY_FS, SPRITE_VS, HOLE_FS, STAR_FS, PILL_FS, BEAM_VS, BEAM_FS, DUST_FS, LABEL_FS, DOWN_FS,     BLOOM_DOWN_FS, BLOOM_UP_FS, FINAL_FS, UI_FS, HL, DISK_OUT_MAP
 from shards import ShardSystem, debris, life_steps, SIM_HZ, SHARD_G
 from stream import StreamSystem, MAX_STARS
 import hdr
@@ -27,6 +27,7 @@ STAR_COLORS = ['#ff9a5c', '#ffc46b', '#ffe6a8', '#fff4e0', '#e4ecff', '#b9cfff',
 DISK_COLOR = QColor('#ffb36b')        # 黑洞吸积盘的颜色，中心到年份的光线从这个颜色开始
 
 SS = 2                    # 超采样倍数（内部按几倍分辨率画）
+HOLE_RES = 1.0            # 黑洞光追按屏幕分辨率的几倍画（最费显卡的一遍；0.75 倍省约 30%，但放大看会糊，用户要清楚）
 MAX_TEX = 4096            # 内部画布最大边长
 # 内部 HDR：中间画布都是 16 位浮点，叠加的光不会被截断，很淡的粒子也不会被舍掉；最后一遍统一加辉光、压亮度、抖动（FINAL_FS）。
 # 辉光从画面里比 BLOOM_T 亮的部分取（文字不算），BLOOM_LEVELS 层由近到远的柔光，BLOOM_K 是强度
@@ -39,13 +40,13 @@ STAR_AREA = 12500         # 随机排布时每颗恒星平均占多大地方（�
 EL_MAP, EL_CINE = 0.22, 0.10          # 黑洞仰角（弧度）：全图稍微斜着看；展开时几乎侧视，像飞船飞到黑洞旁边
 # 展开时黑洞很大、偏左上、一部分在画面外，像坐飞船飞到了黑洞边上（用户自己调出来的位置）：
 # 中心位置（占宽、高的比例）、阴影半径（占高度的比例）
-CINE_X, CINE_Y, CINE_SHADOW = 0.06, 0.34, 0.37
+CINE_X, CINE_Y, CINE_SHADOW = 0.06, 0.34, 0.333
 CINE_RIGHT = 0.05         # 展开时胶囊右端离窗口右边的距离（占宽度）
 CINE_TOP = 0.34           # 展开时恒星和分支放在这条线（占高度）以下，避开吸积盘
 PARALLAX = 0.016          # 展开时黑洞和星空跟着鼠标反方向微微移动（占宽度），看得出黑洞在后、恒星在前
+SKY_PARALLAX = 0.08       # 星空跟着鼠标动多少（以前 0.4：几层星星相对错动太明显，像尘埃在飘）
 CINE_ROLL = -0.10         # 展开时黑洞稍微歪一点，更有镜头感
 CINE_STAR_X = 0.34        # 展开时恒星的位置（占宽度）：在黑洞下面偏左，挡在黑洞前面，右边留给分支
-DISK_OUT = 6.2            # 吸积盘外缘（以视界半径为单位，和着色器里的 R_OUT 一致）
 ANIM_S, CAM_S = 1.1, 1.1  # 动画时长（秒）：普通移动、镜头（展开时恒星重建的时长按模拟出来的算）
 PILL_FADE = (0.0, 0.7)    # 新胶囊在动画的哪一段（按时间 0~1）从透明淡入到不透明
 STAR_SETTLE_S = 0.8       # 点恒星展开时，分支胶囊等恒星（和镜头）差不多停稳了，再从恒星停下的位置长出来
@@ -54,7 +55,7 @@ EXPAND_SLOW = 2.0         # 点恒星展开时恒星、镜头走得比普通移�
 EXPAND_SOFT = 1.5
 # 收起：恒星原地解体（亮一下，整颗同时碎成一粒粒气体），碎下来的气体轻轻飘开、
 # 很快被刹住，再被黑洞吸进去。引力弱一些、绕黑洞走得快一些，所以是绕着黑洞慢慢旋进去（用户要的拉扯感、不用收得太利索）。
-# 气体在显卡上整段模拟（见 shards.py）。差不多吞完时黑洞亮一下、荡开一圈涟漪
+# 气体在显卡上整段模拟（见 shards.py）。差不多吞完时星空荡开一圈涟漪（黑洞本身不发光）
 C_TEAR_S = 0.35           # 原地化开要多久
 C_G = SHARD_G * 0.3
 C_ORBIT, C_SWIRL = 0.8, 0.8           # 漩涡：被吸进去的路上，绕黑洞的速度慢慢（每秒约 0.8）被带到圆轨道速度的 0.8
@@ -380,7 +381,7 @@ class MindMap(QWidget):
         self._anim_moving = False       # 这次动画里有没有东西在飞（只是淡入淡出就不用藏连线）
         # 晶尘粒子，每行：世界 x、y，速度 x、y，剩余寿命，总寿命，大小，颜色 r、g、b，闪烁相位
         self.dust = np.zeros((0, 11), 'f4')
-        self._gulp_t = -99.0            # 碎片差不多都被吸进去的时间（黑洞亮一下、荡开涟漪）；收起时是算好的将来某一刻
+        self._gulp_t = -99.0            # 碎片差不多都被吸进去的时间（星空荡开涟漪）；收起时是算好的将来某一刻
         self.stream = None              # 物质流的粒子（显卡上模拟，见 stream.py），显卡准备好后才建
         self._stream_dirty = False
         self._stream_grow = False       # 有恒星重新出现：物质流要从恒星长出来
@@ -664,7 +665,7 @@ class MindMap(QWidget):
         t0, look = job['t0'], job['look']
         if job['kind'] == 'collapse':
             b = self.parts.add(t0, True, tex, look, job['at'], steps, streaks=True)
-            # 差不多都吞进去（按分量剩 12%）的那一刻：黑洞亮一下，荡开一圈涟漪
+            # 差不多都吞进去（按分量剩 12%）的那一刻：星空荡开一圈涟漪
             order = np.argsort(b.gone)
             w = np.cumsum(b.weight[order])
             self._gulp_t = t0 + float(b.gone[order][np.searchsorted(w, 0.88 * w[-1])])
@@ -678,7 +679,7 @@ class MindMap(QWidget):
                 n.birth_at = bt
             self.parts.add(t0, False, tex, look, birth[job['owner']] - steps / SIM_HZ, steps, streaks=REBIRTH_FX)
             self.anim.dur = lead + 0.3 + BIRTH_TAIL_S + 0.1
-            self._gulp_t = t0                           # 黑洞先亮一下、荡开涟漪，碎片接着冲出来
+            self._gulp_t = t0                           # 先荡开涟漪，碎片接着冲出来
 
     def _settle_drag(self):
         """拖过的恒星松手后还在慢慢停稳（见 _advance）：直接放到它要去的位置、存好。要在重新排布之前做，
@@ -1118,6 +1119,9 @@ class MindMap(QWidget):
             self._draw('pill', np.array(pills, 'f4'), False, vw, vh, t)
         self._draw_particles(vw, vh, t)
         bloom = self._bloom(tex, int(vw * dpr), int(vh * dpr))     # 辉光在写字之前取，字不发光
+        # HDR 屏：比白色亮的部分（盘最亮的地方、光子环、恒星）再往外晕开一圈柔光，像星际穿越里那样，边界被柔光吃掉、不会一块块的。
+        # 从画完恒星、胶囊之后的高光层取：挡在盘前面的恒星不会被盘的光透过来（以前直接取黑洞的高光，恒星看着像半透明的玻璃）
+        glow = self._bloom(self.off_hl[main], int(vw * dpr), int(vh * dpr), 'hglow', 0.0, 0.05) if hdr_on and main in self.off_hl else bloom
         fbo.use(); ctx.viewport = (0, 0, W, H)
         ctx.enable(moderngl.BLEND)
         labels = self._label_instances(dpr * ss)
@@ -1130,25 +1134,28 @@ class MindMap(QWidget):
         ctx.disable(moderngl.BLEND)
         tex.use(0); bloom.use(1)
         self.off_hl.get(main, tex).use(2)
+        glow.use(3)
         on, peak, white = self._out
-        self._set(self.p_final, u_tex=0, u_bloom=1, u_hltex=2, u_bloom_k=BLOOM_K / BLOOM_LEVELS,
+        self._set(self.p_final, u_tex=0, u_bloom=1, u_hltex=2, u_glow=3, u_bloom_k=BLOOM_K / BLOOM_LEVELS,
+                  u_glow_k=HL['HL_GLOW'] / BLOOM_LEVELS if glow is not bloom else 0.0,
+                  u_vp=(vw, vh), u_bh=self.bh[:3],
                   u_hdr=float(on), u_white=white / 80, u_peak=min(peak, HDR_PEAK) / 80, u_flip=float(self._flip))
         self.v_final.render(moderngl.TRIANGLE_STRIP)
 
-    def _bloom(self, src, w, h):
+    def _bloom(self, src, w, h, tag='bloom', thresh=BLOOM_T, knee=BLOOM_KNEE):
         """辉光：先取出亮的部分缩成屏幕一半大小，再一层层缩小（每层一半），然后从最小的一层往回放大、叠到上一层，
         得到由近到远都有的柔光。返回最大的那层（屏幕一半大小）。"""
         ctx = self.ctx
         levels = []
         for i in range(BLOOM_LEVELS):
             w, h = max(1, w // 2), max(1, h // 2)
-            levels.append(self._offscreen(f'bloom{i}', w, h, clamp=True))
+            levels.append(self._offscreen(f'{tag}{i}', w, h, clamp=True))
         ctx.disable(moderngl.BLEND)
         prev = src
         for i, (fbo, (w, h), tex) in enumerate(levels):
             fbo.use(); ctx.viewport = (0, 0, w, h)
             prev.use(0)
-            self._set(self.p_bdown, u_src=0, u_texel=(0.5 / w, 0.5 / h), u_first=float(i == 0), u_thresh=BLOOM_T, u_knee=BLOOM_KNEE)
+            self._set(self.p_bdown, u_src=0, u_texel=(0.5 / w, 0.5 / h), u_first=float(i == 0), u_thresh=thresh, u_knee=knee)
             self.v_bdown.render(moderngl.TRIANGLE_STRIP)
             prev = tex
         ctx.enable(moderngl.BLEND)
@@ -1167,8 +1174,8 @@ class MindMap(QWidget):
         e = self.cine_ease()
         gt = t - self._gulp_t
         sky = dict(u_vp=(vw, vh), u_time=t, u_bh=self.bh[:3], u_cine=e, u_ripple=(gt, 1.0 if 0 <= gt < 1.8 else 0.0),
-                   u_pan=(self.cam_c.x() * self.cam_s - self._par.x() * vw * 0.4 * e,
-                          self.cam_c.y() * self.cam_s - self._par.y() * vh * 0.4 * e))
+                   u_pan=(self.cam_c.x() * self.cam_s - self._par.x() * vw * SKY_PARALLAX * e,
+                          self.cam_c.y() * self.cam_s - self._par.y() * vh * SKY_PARALLAX * e))
         lw, lh = max(1, int(vw * dpr / 2)), max(1, int(vh * dpr / 2))
         lfbo, _, ltex = self._offscreen('sky', lw, lh)
         lfbo.use(); ctx.viewport = (0, 0, lw, lh)
@@ -1186,14 +1193,9 @@ class MindMap(QWidget):
             if n.opacity < 0.01:
                 continue
             gl = max(n.glow, n.act)
-            if n.kind == 'center':
-                if self.parts is not None:              # 碎片正往里掉得越多越亮
-                    gl = max(gl, self.parts.near_hole(t))
-                ft = t - self._gulp_t                   # 吞完后慢慢暗回去
-                if ft >= 0:
-                    gl = max(gl, 1 - smooth(0.0, 1.2, ft))
+            if n.kind == 'center':                     # 收起、展开时黑洞不发光（用户不要），只有拖恒星到跟前时亮起来提示
                 rs_px = n.rpx / 2.6                     # 看到的阴影比视界大 2.6 倍（光线被弯过来）
-                half = rs_px * 11
+                half = rs_px * 17                       # 盘外缘 13 倍视界半径（着色器里 R_OUT_MAP / R_OUT_CINE），方块要比它大
                 holes.append((n.sx, n.sy, half, half) + _rgba(n.color) + (rs_px, gl, n.opacity, half,
                                                                          self.bh[3], self.bh[4], self.cine_ease(), 0))
             elif n.kind == 'year':
@@ -1243,7 +1245,8 @@ class MindMap(QWidget):
         """黑洞逐像素追光线很费显卡，而且画面本身很柔和：按屏幕原分辨率单独画（像素少 4 倍），再放大叠进超采样画布。"""
         ctx = self.ctx
         vw, vh = self.width(), self.height()
-        hw_, hh_ = max(1, int(vw * dpr)), max(1, int(vh * dpr))
+        hs = HOLE_RES                           # 黑洞画面很柔和，再低一点分辨率画也看不出来
+        hw_, hh_ = max(1, int(vw * dpr * hs)), max(1, int(vh * dpr * hs))
         on = self._out[0]
         hname = 'hole_hl' if on else 'hole'
         hfbo, _, htex = self._offscreen(hname, hw_, hh_, hl=on)
@@ -1359,7 +1362,7 @@ class MindMap(QWidget):
                 if e > 0.95:
                     continue
                 alpha = n.opacity * (1 - e)                     # 展开时黑洞变成背景，名字淡掉
-                below = max(n.rpx * 1.5, n.rpx / 2.6 * DISK_OUT * math.sin(self.bh[3]) + 8)    # 放在吸积盘下面
+                below = max(n.rpx * 1.5, n.rpx / 2.6 * DISK_OUT_MAP * math.sin(self.bh[3]) + 8)    # 放在吸积盘下面
                 ax, ay, k = n.sx, n.sy + below, n.k
             elif n.kind == 'year':
                 alpha = n.opacity * self._retreat(n) * (200 + 35 * max(n.act, n.glow)) / 255

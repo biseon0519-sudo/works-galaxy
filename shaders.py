@@ -3,13 +3,17 @@
 # 不到 1/255 的光会被舍掉；浮点画布全保留，整体会亮一些。乘这个系数，让整体亮度和以前调好的差不多（边缘更柔和）
 GAS_K = 0.8
 # HDR 高光强度（只在 HDR 屏上有，加在 SDR 画面之上；线性，1 = 再亮一个 SDR 白色）。总上限见 mindmap.HDR_PEAK
-HL = dict(HL_DISK=1.4, HL_DISK_POW=2.5, HL_RING=2.5, HL_GULP=1.5, HL_CORE=0.35, HL_FLASH=1.2, HL_SPARK=2.0, HL_GAS=0.8,
+# HL_DISK：盘在 SDR 里亮过 HL_DISK_KNEE（色调映射前）的部分接着往上亮；HL_GLOW：黑洞高光晕开的柔光（mindmap 里另做一遍辉光）
+HL = dict(HL_DISK=0.6, HL_DISK_SOFT=1.0, HL_DISK_KNEE=1.0, HL_GLOW=1.2, HL_RING=1.5, HL_GULP=1.5, HL_CORE=0.8, HL_SURF=0.5, HL_SURF_POW=2.0, HL_EDGE=1.5, HL_FLASH=1.2, HL_SPARK=2.0, HL_GAS=0.8,
           HL_STAR=2.5)
 import os as _os      # 调参用：环境变量 HL_DISK=… 临时覆盖（不改代码）
 HL.update({k: float(_os.environ[k]) for k in HL if k in _os.environ})
 HL_DEFS = ''.join(f'#define {k} {v!r}\n' for k, v in HL.items())
 # 恒星解体时碎成的晶胞：气体分布半径里每单位多少格；每粒开始碎的时刻在 tear 的 0~GRAIN_SPAN 里均匀随机（剩下的是碎掉要多久）。
 # shards.grain_time 用同样的散列给每团气体定出发时刻，两边要一致
+# 吸积盘外缘（以视界半径为单位）：全图、展开的近景。星际穿越里盘比整个黑洞宽很多、伸出画面（以前只到 6.2，看着“近近的”）；
+# 全图用户要折中。黑洞光追、物质流被盘挡住、黑洞名字的位置都用这两个数
+DISK_OUT_MAP, DISK_OUT_CINE = 9.5, 13.0
 GRAIN = 8.0
 GRAIN_SPAN = 0.6
 GRAIN_GO = 0.3           # 那粒碎到这一步（淡掉一小半）时，同一位置的气体才出发（早了气体会叠在完整的星面上，把花纹盖成一片纯色）
@@ -159,10 +163,44 @@ uniform float u_time;
 in vec2 v_local; flat in vec4 v_color; flat in vec4 v_p1; flat in vec4 v_p2;
 out vec4 f;
 ''' + NOISE + '''
+float fbm2(vec2 p){ return 0.62 * noise(p) + 0.38 * noise(p * 2.03 + vec2(1.7, 9.2)) + 0.03; }    // 细丝只要两层（每步都算，很费显卡）
 float fbm4(vec2 p){ float v = 0., a = .5; for (int i = 0; i < 4; i++){ v += a * noise(p); p = p * 2.03 + vec2(1.7, 9.2); a *= .5; } return v + 0.03; }
 const float R_IN = 2.3, R_OUT = 6.2;
+// 盘的外缘：全图 R_OUT_MAP、近景 R_OUT_CINE（见 Python 里的 DISK_OUT_*）。
+// 亮度、颜色、厚度按“缩回 R_OUT 大小后的半径” rn 算，大盘就是把原来的样子等比例拉宽；转速、多普勒、细丝按真实半径
+#ifndef R_OUT_MAP
+#define R_OUT_MAP DISK_OUT_MAP_
+#endif
+#ifndef R_OUT_CINE
+#define R_OUT_CINE DISK_OUT_CINE_
+#endif
+#ifndef TH_POW
+#define TH_POW 0.0
+#endif
+float ROUT = R_OUT, SC = 1.0;                               // 这一帧的盘外缘、拉宽了几倍（main 里按近景程度设）
+float rnorm(float rr){ return R_IN + (rr - R_IN) / SC; }
+// 星际穿越的样子：亮度往外掉得快（内圈白热、外圈暗成琥珀褐），沿轨道拉长的细丝（STREAK_F 每单位半径几道，
+// STREAK_MIX 改密度、STREAK_EMIT 改亮度），多普勒两边的差别减半（电影里几乎没有一边亮一边暗）。调参时可以在前面先 #define 覆盖
+#ifndef DISK_FALL
+#define DISK_FALL 2.6
+#endif
+#ifndef DISK_GAIN
+#define DISK_GAIN 2.4
+#endif
+#ifndef STREAK_F
+#define STREAK_F 5.0
+#endif
+#ifndef STREAK_MIX
+#define STREAK_MIX 0.7
+#endif
+#ifndef STREAK_EMIT
+#define STREAK_EMIT 0.7
+#endif
+#ifndef DOP_K
+#define DOP_K 0.5
+#endif
 // 盘有厚度（不是一张纸）：半厚度内薄外厚，外缘微微鼓起
-float halfH(float rr){ return 0.04 + 0.045 * (clamp(rr, R_IN, R_OUT) - R_IN); }
+float halfH(float rr){ return (0.04 + 0.045 * (clamp(rnorm(rr), R_IN, R_OUT) - R_IN)) * pow(SC, TH_POW); }    // 拉宽时厚度不跟着等比例加厚，看起来更薄更开阔
 // 盘里一点的发光颜色（rgb）和密度（a）
 vec4 disk(vec3 hit, float rr, vec3 v){
     float phi = atan(hit.z, hit.x);
@@ -178,21 +216,31 @@ vec4 disk(vec3 hit, float rr, vec3 v){
     float yv = hit.y * 0.7;                                 // 不同高度的气体略有不同，看起来才有体积，不是一张纸压出来的
     float n = mix(fbm4(pp1 * 0.9 + vec2(rr * 0.6, yv)), fbm4(pp2 * 0.9 + vec2(rr * 0.6, yv)), mixw);
     n = clamp((n - 0.5) * 1.9 + 0.5, 0.0, 1.0);             // 两层混合会把明暗抵消掉一些，补回对比度
-    float x = (rr - R_IN) / (R_OUT - R_IN);
-    float T = pow(R_IN / rr, 0.9);                          // 越靠里越热
-    vec3 base = mix(vec3(0.95, 0.28, 0.06), vec3(1.0, 0.78, 0.45), T);
-    base = mix(base, vec3(1.0, 0.97, 0.9), T * T * 0.7);
+    float x = (rr - R_IN) / (ROUT - R_IN), rn = rnorm(rr);
+    // 星际穿越那种沿轨道拉长的细丝：半径方向变化快、沿轨道变化慢（噪声坐标里沿轨道只走一个小圈）。
+    // 越往外越明显（外圈一道道暗的尘埃带），内圈白热、平滑
+    vec2 c1 = vec2(cos(a1), sin(a1)), c2 = vec2(cos(a2), sin(a2));
+    float st = mix(fbm2(vec2(rr * STREAK_F, 3.1) + c1 * 0.9 + 7.3 * floor(u_time / PERIOD)),
+                   fbm2(vec2(rr * STREAK_F, 3.1) + c2 * 0.9 + 7.3 * floor(u_time / PERIOD + 0.5) + 3.7), mixw);
+    st = clamp((st - 0.5) * 2.2 + 0.5, 0.0, 1.0);
+    float sk = smoothstep(0.0, 0.45, x);
+    n = mix(n, st, STREAK_MIX * sk);
+    float T = pow(R_IN / rn, 0.9);                          // 越靠里越热
+    // 颜色：外圈琥珀褐 → 桃色 → 内圈白热（星际穿越的配色，比以前的橙色淡、不那么饱和）
+    vec3 base = mix(vec3(0.78, 0.40, 0.17), vec3(1.0, 0.80, 0.62), smoothstep(0.35, 0.8, T));
+    base = mix(base, vec3(1.0, 0.96, 0.92), smoothstep(0.7, 1.0, T));
     vec3 vel = normalize(vec3(-hit.z, 0.0, hit.x));         // 盘的转动方向
     float beta = sqrt(0.5 / rr);
     float dop = sqrt(1.0 - beta * beta) / (1.0 - beta * dot(vel, -v));     // 朝我们转来的一侧更亮
     float g = sqrt(max(0.0, 1.0 - 1.0 / rr));               // 引力红移
     // 真实的多普勒增亮两边能差十几倍（一边几乎看不见）；这里压到三倍左右，保留一点真实感，另一边也看得到盘
-    float I = (pow(dop, 1.3) * g * g + 0.22) * pow(R_IN / rr, 1.2) * 1.45;
+    float I = (mix(1.0, pow(dop, 1.3), DOP_K) * g * g + 0.22) * pow(R_IN / rn, DISK_FALL) * DISK_GAIN;
     float edge = smoothstep(0.0, 0.06, x) * (1.0 - smoothstep(0.35, 1.0, x));
     float h = halfH(rr) * (0.7 + 0.6 * n);                  // 上下表面跟着湍流起伏，边缘是一缕缕的
     float prof = exp(-pow(hit.y / h, 2.0));
     float dens = edge * prof * (0.45 + 0.75 * n);
-    return vec4(base * I * 3.0, dens * min(I * 1.5, 1.0));
+    float lum = mix(1.0, 0.35 + 1.3 * st, STREAK_EMIT * sk);      // 细丝也调制亮度（不透明处只看得到表面的光，光改密度显不出来）
+    return vec4(base * I * 3.0 * lum, dens * min(I * 1.5, 1.0));
 }
 void main(){
     float rsPx = v_p1.x, hv = v_p1.y, op = v_p1.z, half_ = v_p1.w;
@@ -207,8 +255,9 @@ void main(){
     vec3 v = normalize(fw + (q.x * rt + q.y * up) / D);
     vec3 p = cam;
     vec3 col = vec3(0.0); float trans = 1.0;
-    vec3 hot = vec3(0.0); float ringH = 0.0;               // HDR 高光：盘最内圈的光、光子环
-    const float RB = 16.0;                                  // 这个范围外光线几乎不弯，也碰不到盘
+    vec3 colD = vec3(0.0); float ringH = 0.0;              // HDR 高光：盘自己的光（色调映射前）、光子环
+    ROUT = mix(R_OUT_MAP, R_OUT_CINE, v_p2.z); SC = (ROUT - R_IN) / (R_OUT - R_IN);
+    float RB = max(16.0, ROUT * 1.15);                      // 这个范围外光线几乎不弯，也碰不到盘
     float b = dot(p, v), disc = b * b - (dot(p, p) - RB * RB);
     if (disc > 0.0){                                        // 光线会经过黑洞附近：先直线走过去，再一步步算弯曲
         p += v * (-b - sqrt(disc));
@@ -221,12 +270,12 @@ void main(){
             float dt = clamp(0.05 * r, 0.012, 0.6);
             float rr = length(p.xz);
             float hh = halfH(rr);
-            bool inR = rr > R_IN * 0.8 && rr < R_OUT * 1.08;
+            bool inR = rr > R_IN * 0.8 && rr < ROUT * 1.08;
             // 盘是一层有厚度的气体：快到盘时步子放小，穿过盘时一小步一小步地累加发光和遮挡（体积渲染）
             if (inR){
                 float gap = max(abs(p.y) - hh * 2.4, 0.0);
                 dt = min(dt, (gap + hh * 0.5) / max(abs(v.y), 1e-3));
-                if (gap == 0.0) dt = min(dt, 0.2);         // 在盘里每步 0.2（再小看不出区别，只是更费显卡）
+                if (gap == 0.0) dt = min(dt, 0.2);         // 在盘里每步 0.2（再小看不出区别，只是更费显卡；外圈放大步子会出现细沙一样的颗粒）
                 dt = max(dt, 0.008);
             }
             v += -1.5 * h2 * p / pow(r, 5.0) * dt;
@@ -235,14 +284,14 @@ void main(){
             if (inR && abs(p.y) < hh * 2.6){
                 vec3 s = mix(p, pn, jit);
                 float sr = length(s.xz);
-                if (sr > R_IN && sr < R_OUT){
+                if (sr > R_IN && sr < ROUT){
                     vec4 e = disk(s, sr, normalize(v));
                     // 光线往上走 = 看到的是盘的底面（黑洞下方那道弧），压暗压细，不然像“眼袋”
                     float under = smoothstep(-0.03, 0.03, v.y);
                     e.rgb *= 1.0 - 0.7 * under;
                     float dA = 1.0 - exp(-e.a * dt * mix(9.0, 2.5, under));       // 吸收强一点：看到的是盘最外面一层，湍流细节不会被平均掉
                     col += trans * e.rgb * dA;
-                    hot += trans * e.rgb * dA * pow(R_IN / sr, HL_DISK_POW);
+                    colD += trans * e.rgb * dA;
                     trans *= 1.0 - dA;
                 }
             }
@@ -262,14 +311,19 @@ void main(){
     float alpha = 1.0 - trans;
     float rq = length(q);
     col += vec3(1.0, 0.55, 0.25) * exp(-max(rq - 2.6, 0.0) * 0.4) * 0.09 * (1.0 + hv) * (1.0 - alpha);
-    col = 1.0 - exp(-col * mix(1.25, 0.95, v_p2.z));        // 色调映射，亮处不发白爆掉；近景收一点曝光，盘不糊成一片
+    float expo = mix(1.25, 0.95, v_p2.z);
+    col = 1.0 - exp(-col * expo);                           // 色调映射，亮处不发白爆掉；近景收一点曝光，盘不糊成一片
+    // HDR：SDR 里亮到快饱和的盘，在 HDR 屏上按它本来的明暗继续往上亮（亮度跟着盘的结构平滑变化，亮处也留得住纹理）
+    vec3 hot = max(colD * expo - HL_DISK_KNEE, 0.0);
+    hot = hot * hot / (hot + HL_DISK_SOFT);                  // 刚过门槛时慢慢起来，不出现一道硬边
     float win = 1.0 - smoothstep(0.8, 1.0, max(abs(v_local.x), abs(v_local.y)) / half_);
     f = vec4(col * op * win, alpha * op * win);
-    hl = (HL_DISK * hot * mix(1.0, 0.8, v_p2.z) + HL_RING * vec3(1.0, 0.86, 0.7) * ringH
+    hl = (HL_DISK * hot + HL_RING * vec3(1.0, 0.86, 0.7) * ringH
           + HL_GULP * vec3(1.0, 0.7, 0.45) * hv * hv * exp(-max(rq - 1.6, 0.0) * 1.2) * (1.0 - alpha)) * op * win;
 }
 '''
-HOLE_FS = with_hl(HOLE_FS.replace('#version 330', '#version 330\n' + HL_DEFS, 1))
+HOLE_FS = with_hl(HOLE_FS.replace('#version 330', '#version 330\n' + HL_DEFS, 1)
+                  .replace('DISK_OUT_MAP_', repr(DISK_OUT_MAP)).replace('DISK_OUT_CINE_', repr(DISK_OUT_CINE)))
 
 # 恒星：照着太阳实拍的样子——会自转的球面上有米粒状的对流元胞、明暗斑、几个黑子（本影 + 半影），边缘变暗偏红，
 # 边上一圈色球层和一缕缕往外喷的日珥，外面是带放射状亮纹的日冕。朝黑洞那一侧被潮汐轻轻拉出一点，物质从那里被吸走
@@ -383,7 +437,8 @@ void main(){
     em *= 1.0 - smoothstep(3.2, 4.9, max(abs(q0.x), abs(q0.y)));      // 画到方块边缘前淡掉
     // 一开始撕，外面的柔光就很快没了：柔光照亮了周围的星空，撕掉的那块没有柔光，对比起来像个跟着星体走的暗洞（残影）
     em *= exp(-tear * 12.0);
-    vec3 col = surf * (glowk + ember) * (0.85 + 0.25 * lift) + em * (1.0 - body0);
+    vec3 sface = surf * (glowk + ember) * (0.85 + 0.25 * lift);
+    vec3 col = sface + em * (1.0 - body0);
     col = 1.0 - exp(-col * 1.25);
     // 暗影只压在星体外面，跟着星体化开淡掉（不然星体碎掉后原地留一块暗斑）
     float shade = act * 0.45 * exp(-o * 1.3) * (1.0 - smoothstep(2.6, 4.6, max(abs(q0.x), abs(q0.y)))) * (1.0 - tear);
@@ -391,7 +446,10 @@ void main(){
     f = vec4(col * op, (body * keep + (1.0 - body0) * shade) * op);
     float flashH = clamp(hv - 1.0, 0.0, 1.5);
     vec3 whiteHot = mix(c, vec3(1.0, 0.97, 0.92), 0.7);
-    hl = (HL_CORE * exp(-r * r * 3.0) * glowk + HL_FLASH * flashH * (glowk + exp(-o * 3.0) * (1.0 - body0) * 0.5)) * whiteHot * op;
+    // HDR：整个星面按自己的明暗再亮一截（花纹保留，不是一块白），中心更亮；日珥、色球层的亮边也亮出来
+    hl = ((HL_CORE * exp(-r * r * 3.0) * glowk + HL_FLASH * flashH * (glowk + exp(-o * 3.0) * (1.0 - body0) * 0.5)) * whiteHot
+          + HL_SURF * pow(max(sface, 0.0), vec3(HL_SURF_POW)) * body * keep      // 越亮的地方提得越多，花纹的明暗拉开（同比例提亮再被上限压回来会发糊）
+          + HL_EDGE * mix(c, vec3(1.0, 0.42, 0.22), 0.55) * (prom * 1.4 + chrom * 0.8) * lift * (1.0 - body0) * exp(-tear * 12.0)) * op;   // 和上面的柔光一样一碎开就消失，不然原地留一圈亮环
 }
 '''
 STAR_FS = with_hl(STAR_FS.replace('#version 330', '#version 330\n' + HL_DEFS, 1))
@@ -607,6 +665,8 @@ uniform vec2 u_vp;
 uniform vec3 u_bh;            // 黑洞在屏幕上的位置、一个视界半径是多少像素
 uniform float u_roll, u_alpha;
 uniform vec3 u_disk;          // 吸积盘的颜色
+uniform vec3 u_n;             // 吸积盘的法线
+uniform float u_rout;         // 吸积盘外缘（视界半径）
 in vec2 in_corner;
 in vec4 i_a;                  // 位置 xyz，出发后过了多久
 in vec4 i_c;                  // 属于哪颗恒星，随机数，种类，大小
@@ -632,6 +692,15 @@ void main(){
     float a = smoothstep(0.0, 0.3, age) * smoothstep(2.0, 2.9, r);
     if (p.z > 0.0) a *= smoothstep(2.45, 2.8, length(q));     // 绕到黑洞后面：被挡住
     a *= 1.0 - 0.55 * smoothstep(6.5, 3.0, r);                // 汇进盘里，和盘的光融在一起
+    // 盘挡在粒子前面（镜头到粒子的直线先穿过盘面，穿过的地方在盘里）：被挡住。盘大了以后，近景里恒星的流是从盘的近侧后面汇进去的，
+    // 不挡的话像浮在盘面上。不算光线弯曲（盘的近侧几乎不弯）
+    vec3 cam = vec3(0.0, 0.0, -40.0);
+    float dc = dot(cam, u_n), dp = dot(p, u_n);
+    if (dc * dp < 0.0){
+        vec3 hit = mix(cam, p, dc / (dc - dp));
+        float rh = length(hit - u_n * dot(hit, u_n));
+        a *= 1.0 - 0.95 * smoothstep(2.0, 2.6, rh) * smoothstep(u_rout, u_rout * 0.75, rh);
+    }
     vec3 col = mix(u_scol[o].rgb, u_disk, smoothstep(0.0, 1.0, near));
     col = mix(col, vec3(1.0, 0.95, 0.88), near * near * 0.5);
     v_col = vec4(col * (1.0 + 1.2 * near), a * u_scol[o].a * u_alpha);
@@ -904,8 +973,9 @@ void main(){
 # 平滑地压进去，三个通道按同一个比例压（分开压会把黄色的恒星压得发白）；辉光主要照亮暗的周围，叠在本来就亮的地方很少（不会把恒星表面、吸积盘冲成一片白）；最后加一点抖动，深色渐变不出色带
 FINAL_FS = '''
 #version 330
-uniform sampler2D u_tex, u_bloom, u_hltex;
-uniform float u_bloom_k;
+uniform sampler2D u_tex, u_bloom, u_hltex, u_glow;
+uniform float u_bloom_k, u_glow_k;          // u_glow：HDR 时黑洞高光晕开的柔光（线性，直接加）
+uniform vec2 u_vp; uniform vec3 u_bh;       // 逻辑视口尺寸；黑洞在屏幕上的位置和阴影半径（像素）：柔光不罩进阴影里
 uniform float u_hdr, u_white, u_peak;      // HDR 输出：开没开、SDR 白色和显示器峰值（scRGB 单位，1.0 = 80 尼特）
 uniform float u_flip;                      // 画进 D3D 纹理时上下翻转（D3D 从上往下存，OpenGL 从下往上）
 in vec2 v_uv; out vec4 f;
@@ -933,7 +1003,10 @@ void main(){
     vec3 b = shoulder(texture(u_bloom, uv).rgb * u_bloom_k);
     vec3 room = 1.0 - min(c, 1.0);
     c += b * room * room;
+    float hole = length(vec2(uv.x, 1.0 - uv.y) * u_vp - u_bh.xy) / max(u_bh.z, 1.0);
     vec3 L = lin(c) + max(texture(u_hltex, uv).rgb, 0.0);
+    // 柔光主要照亮暗的周围，本来就亮的地方（恒星表面、盘）叠得少，花纹不被冲淡（和 SDR 的辉光一样的道理）；也不罩进黑洞阴影
+    L += texture(u_glow, uv).rgb * u_glow_k * smoothstep(0.8, 1.05, hole) / (1.0 + 1.5 * max(L.r, max(L.g, L.b)));
     float top = max(u_peak / u_white, 1.0);
     float m = max(L.r, max(L.g, L.b));
     if (m > 1.0 && top > 1.0) L *= (1.0 + (top - 1.0) * (1.0 - exp(-(m - 1.0) / (top - 1.0)))) / m;

@@ -188,15 +188,6 @@ class ShardSystem:
     def active(self, now, forward=None):
         return any(now < b.end and (forward is None or b.forward == forward) for b in self.bursts)
 
-    def near_hole(self, now):
-        """正在掉进黑洞的碎片有多少（按分量算，0~1）：快掉进去（0.15 秒内）的占这批总量的比例，给黑洞亮度用。"""
-        g = 0.0
-        for b in self.bursts:
-            if b.forward and now < b.end:
-                dt = b.gone - (now - b.t0)
-                g = max(g, float(b.weight[(dt >= 0) & (dt < 0.15)].sum() / (0.15 * b.weight.sum())))
-        return min(1.0, g)
-
     def tidy(self, now):
         for b in [b for b in self.bursts if now > b.end + 0.2]:
             b.release()
